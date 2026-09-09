@@ -1,0 +1,6 @@
+{
+  "host": "stream-sbe.binance.com",
+  "port": "443",
+  "api_key_file": "../../systematic-trading-platform/LiveTrading/binance/quant0/binance_api_key",
+  "symbols": ["ETHBTC", "ETHUSDT", "BTCUSDT", "BNBBTC", "BNBUSDT"]
+}

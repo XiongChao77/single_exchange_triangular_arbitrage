@@ -1,0 +1,9 @@
+/build/
+/logs/
+/.deps/
+__pycache__/
+*.pem
+*api_key*
+*api_secret*
+*.log
+/tests/
