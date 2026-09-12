@@ -62,11 +62,18 @@ Config load_config(const std::filesystem::path& path);
 std::vector<TradeGroup> validate_arbitrage(const Config& config, const nlohmann::json& exchange_info);
 std::string stream_target(const std::vector<std::string>& symbols);
 
-// Simplified order book storing only the best bid and ask.
+// Latest 20-level partial depth snapshot. The duplicated best bid/ask fields are
+// the hot path used by edge scanning and execution.
 // Decimal value = mantissa * 10^exponent; no floating-point rounding on ingestion.
 struct OrderBook {
+    struct Level {
+        std::int64_t price{};
+        std::int64_t qty{};
+        std::int8_t price_exponent{};
+        std::int8_t qty_exponent{};
+    };
     std::string symbol;
-    std::optional<std::int64_t> event_time_us; // Unavailable in Spot bookTicker.
+    std::optional<std::int64_t> event_time_us; // Unavailable in partial depth payloads.
     std::int64_t received_time_us{};
     std::int64_t received_steady_ns{};
     std::uint64_t receive_sequence{};
@@ -77,10 +84,14 @@ struct OrderBook {
     std::int64_t bid_qty{};
     std::int64_t ask_price{};
     std::int64_t ask_qty{};
+    std::array<Level, 20> bids{};
+    std::array<Level, 20> asks{};
+    std::size_t bid_levels{};
+    std::size_t ask_levels{};
 };
 
-OrderBook decode_best_bid_ask(const nlohmann::json& message,
-                             std::int64_t received_time_us);
+OrderBook decode_partial_depth(const nlohmann::json& message,
+                               std::int64_t received_time_us);
 
 struct OrderBookStats {
     std::size_t symbols;

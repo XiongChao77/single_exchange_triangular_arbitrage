@@ -1,10 +1,6 @@
 {
   "host": "stream.binance.com",
   "port": "9443",
-  "triangles": [
-    ["ETHBTC", "ETHUSDT", "BTCUSDT"],
-    ["BTCUSDT", "BNBBTC", "BNBUSDT"]
-  ],
   "execution_mode": "paper",
   "live_test_mode": true,
   "api_key_file": "/root/work/systematic-trading-platform/LiveTrading/binance/main/hmac_api_key",
@@ -13,5 +9,49 @@
   "max_arbitrage_usdt": 20,
   "commission_taker": 0.0001,
   "commission_maker": 0.0001,
-  "edge_threshold":  0.0001
+  "edge_threshold":  0.0001,
+  "triangles": [
+    ["ETHBTC", "ETHUSDT", "BTCUSDT"],
+    ["BTCUSDT", "BNBBTC", "BNBUSDT"],
+    [
+      "ETHUSDT",
+      "XLMETH",
+      "XLMUSDT"
+    ],
+    [
+      "ETHUSDT",
+      "SOLETH",
+      "SOLUSDT"
+    ],
+    [
+      "ETHUSDT",
+      "LINKETH",
+      "LINKUSDT"
+    ],
+    [
+      "ETHIDR",
+      "ETHUSDT",
+      "USDTIDR"
+    ],
+    [
+      "ETHUSDT",
+      "LTCETH",
+      "LTCUSDT"
+    ],
+    [
+      "ETHUSD",
+      "ETHUSDT",
+      "USDTUSD"
+    ],
+    [
+      "AAVEETH",
+      "AAVEUSDT",
+      "ETHUSDT"
+    ],
+    [
+      "ETHUSDT",
+      "WBETHETH",
+      "WBETHUSDT"
+    ]
+  ]
 }

@@ -155,18 +155,19 @@ std::vector<TradeGroup> validate_arbitrage(const Config& config, const nlohmann:
         if (degree.size() != 3 || std::any_of(degree.begin(), degree.end(), [](const auto& asset) { return asset.second != 2; }))
             throw std::runtime_error("Arbitrage group " + std::to_string(group) + " does not form a three-asset closed loop");
         const auto& indices = config.triangle_indices[group];
-        // Only USDT is funded initially. Each USDT-quoted market is a
-        // possible first purchase, giving the two directions of the triangle.
+        // Only USDT is funded initially. Each market containing USDT is a
+        // possible first conversion: BUY when USDT is quote, SELL when it is base.
         TradeGroup trading_group{indices, {}};
         std::size_t path_count = 0;
         for (std::size_t first_leg = 0; first_leg < 3; ++first_leg) {
             const auto& [first_base, first_quote] = markets.at(config.symbols.at(indices[first_leg]));
-            if (first_quote != "USDT") continue;
+            if (first_base != "USDT" && first_quote != "USDT") continue;
             TradePath path{};
-            path[0] = {indices[first_leg], true};
+            const bool first_buy = first_quote == "USDT";
+            path[0] = {indices[first_leg], first_buy};
             std::array<bool, 3> used{};
             used[first_leg] = true;
-            auto current_asset = first_base;
+            auto current_asset = first_buy ? first_base : first_quote;
             for (std::size_t leg = 1; leg < 3; ++leg) {
                 bool found = false;
                 for (std::size_t candidate = 0; candidate < 3; ++candidate) {
@@ -187,7 +188,7 @@ std::vector<TradeGroup> validate_arbitrage(const Config& config, const nlohmann:
         }
         if (path_count != trading_group.paths.size())
             throw std::runtime_error("Arbitrage group " + std::to_string(group) +
-                                     " must contain two USDT-quoted markets");
+                                     " must contain two markets connected to USDT");
         groups.push_back(trading_group);
     }
     return groups;
@@ -198,26 +199,50 @@ std::string stream_target(const std::vector<std::string>& symbols) {
     for (const auto& symbol : symbols) {
         if (target.back() != '=') target += '/';
         for (char c : symbol) target += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-        target += "@bookTicker";
+        target += "@depth20@100ms";
     }
     return target;
 }
 
-OrderBook decode_best_bid_ask(const nlohmann::json& message, std::int64_t received_time_us) {
-    const bool combined = message.is_object() && message.contains("stream");
-    const auto& data = combined ? message.at("data") : message;
+OrderBook decode_partial_depth(const nlohmann::json& message, std::int64_t received_time_us) {
+    if (!message.is_object() || !message.contains("stream") || !message.at("stream").is_string())
+        throw std::runtime_error("Partial depth requires a combined stream wrapper");
+    const auto& stream = message.at("stream").get_ref<const std::string&>();
+    const auto separator = stream.find('@');
+    if (separator == std::string::npos || stream.substr(separator) != "@depth20@100ms")
+        throw std::runtime_error("Unexpected partial depth stream");
     OrderBook orderbook;
-    orderbook.symbol = data.at("s").get<std::string>();
-    const auto& update = data.at("u");
+    orderbook.symbol = stream.substr(0, separator);
+    for (auto& ch : orderbook.symbol)
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+    const auto& data = message.at("data");
+    const auto& update = data.at("lastUpdateId");
     if (!update.is_number_integer() ||
         (update.is_number_unsigned() && update.get<std::uint64_t>() >
             static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())))
-        throw std::runtime_error("Invalid book update ID");
+        throw std::runtime_error("Invalid partial depth update ID");
     orderbook.book_update_id = update.get<std::int64_t>();
-    if (orderbook.book_update_id < 0) throw std::runtime_error("Negative book update ID");
+    if (orderbook.book_update_id < 0) throw std::runtime_error("Negative partial depth update ID");
     orderbook.received_time_us = received_time_us;
-    decimal_pair(data.at("b"), data.at("a"), orderbook.bid_price, orderbook.ask_price, orderbook.price_exponent);
-    decimal_pair(data.at("B"), data.at("A"), orderbook.bid_qty, orderbook.ask_qty, orderbook.qty_exponent);
+    const auto read_side = [](const nlohmann::json& side, auto& levels, std::size_t& count) {
+        if (!side.is_array() || side.empty() || side.size() > levels.size())
+            throw std::runtime_error("Partial depth side must contain 1 to 20 levels");
+        count = side.size();
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!side[i].is_array() || side[i].size() != 2)
+                throw std::runtime_error("Invalid partial depth level");
+            const auto price = decimal(side[i][0]);
+            const auto quantity = decimal(side[i][1]);
+            levels[i] = {price.mantissa, quantity.mantissa,
+                static_cast<std::int8_t>(-price.scale), static_cast<std::int8_t>(-quantity.scale)};
+        }
+    };
+    read_side(data.at("bids"), orderbook.bids, orderbook.bid_levels);
+    read_side(data.at("asks"), orderbook.asks, orderbook.ask_levels);
+    decimal_pair(data.at("bids")[0][0], data.at("asks")[0][0],
+                 orderbook.bid_price, orderbook.ask_price, orderbook.price_exponent);
+    decimal_pair(data.at("bids")[0][1], data.at("asks")[0][1],
+                 orderbook.bid_qty, orderbook.ask_qty, orderbook.qty_exponent);
     return orderbook;
 }
 

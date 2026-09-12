@@ -8,7 +8,8 @@ C++20 market-data ingestion for two triangles:
 | USDT / BTC / BNB | BTCUSDT, BNBBTC, BNBUSDT |
 
 The shared BTCUSDT stream is subscribed once. All five symbols use
-`<symbol>@bookTicker` on one TLS WebSocket connection. Symbols are read directly
+`<symbol>@depth20@100ms` on one TLS WebSocket connection. Each message replaces the
+local 20-level snapshot for that symbol; edge scanning reads only level one. Symbols are read directly
 from `triangles` in the configuration. Startup assigns each unique symbol a
 shared slot in first-appearance order. Stream
 names are lowercased when building the subscription URL; received symbol names
@@ -22,6 +23,9 @@ On Ubuntu these are provided by `cmake g++ libboost-dev libssl-dev
 nlohmann-json3-dev python3`; the tests also use the `openssl` command.
 
 ```bash
+cmake -S . -B build-debug -DBUILD_TESTING=OFF
+cmake --build build-debug -j 2
+
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
 ctest --test-dir build --output-on-failure
@@ -57,13 +61,13 @@ until Ctrl+C or SIGTERM. There are no command-line options. Start with:
 The default endpoint is `wss://stream.binance.com:9443`; set `port` to `"443"`
 in `configs/binance.json` to use `wss://stream.binance.com:443`.
 Public market streams require no API key. The client subscribes through
-`/stream?streams=ethbtc@bookTicker/...` and decodes JSON text messages
+`/stream?streams=ethbtc@depth20@100ms/...` and decodes JSON text messages
 (including the combined-stream `stream`/`data` envelope).
 
 Prices and quantities are parsed from decimal strings into integer mantissas
 and shared bid/ask exponents without floating-point conversion. Invalid JSON fields and
 integer overflow are rejected.
-Spot `bookTicker` does not include an exchange event timestamp, so
+Spot partial depth payloads do not include an exchange event timestamp, so
 `event_time_us` and `exchange_to_receive_us` are logged as `null`.
 Receiver, latest orderbook store and logger statistics are available in `scripts/analyze_logs.py`.
 
@@ -99,7 +103,8 @@ The REST request has a 15-second deadline. Optional `rest_host` and `rest_port`
 in the same config default to `api.binance.com` and `443`. Optional `ca_file`
 applies to both HTTPS and WebSocket TLS verification.
 
-`OrderBook` is currently simplified to the best bid and ask; full depth is not yet implemented.
+`OrderBook` stores the latest 20 bid and 20 ask levels from each partial depth snapshot.
+`scan_edge` intentionally reads only the duplicated best bid and ask fields.
 `OrderBookManager` stores one optional orderbook per symbol in a fixed-size vector.
 The receiver performs one symbol-to-index lookup, then overwrites that slot.
 Readers use precomputed indices with `get(index)`, or copy all slots under one

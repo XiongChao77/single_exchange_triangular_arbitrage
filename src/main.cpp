@@ -56,7 +56,7 @@ int main() {
             [&](const triangular::ArbitrageOpportunity& opportunity) {
                 if (executor) executor->try_start(opportunity);
             });
-        boost::asio::signal_set signals(io, SIGINT, SIGTERM);
+        boost::asio::signal_set signals(io, SIGINT, SIGTERM); // catch ctrl+c
         boost::asio::steady_timer duration(io);
         boost::asio::steady_timer statistics(io);
         auto report = [&](const char* event) {
@@ -104,6 +104,8 @@ int main() {
                 {"bid_qty", orderbook.bid_qty},
                 {"ask_price", orderbook.ask_price},
                 {"ask_qty", orderbook.ask_qty},
+                {"bid_levels", orderbook.bid_levels},
+                {"ask_levels", orderbook.ask_levels},
                 {"index", index}});
         }
         if (executor) logger.log("INFO", "execution_final", executor->stats());

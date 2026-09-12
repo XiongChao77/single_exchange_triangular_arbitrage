@@ -205,19 +205,23 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         const auto snapshot = books.snapshot();
         for (auto& [asset, amount] : holdings) {
             if (asset == "USDT" || amount <= 0) continue;
-            std::optional<std::size_t> exit_index;
-            for (const auto index : config.trading_groups.at(opportunity.group_index).symbol_indices)
-                if (markets[index].base == asset && markets[index].quote == "USDT") exit_index = index;
-            if (!exit_index) { halt("No USDT market for initial asset"); return; }
-            const auto& market = markets.at(*exit_index);
-            const auto& book = snapshot.at(*exit_index);
+            std::optional<TradeLeg> exit_leg;
+            for (const auto index : config.trading_groups.at(opportunity.group_index).symbol_indices) {
+                const auto& candidate = markets[index];
+                if (candidate.base == asset && candidate.quote == "USDT") exit_leg = TradeLeg{index, false};
+                else if (candidate.base == "USDT" && candidate.quote == asset) exit_leg = TradeLeg{index, true};
+            }
+            if (!exit_leg) { halt("No USDT market for initial asset"); return; }
+            const auto& market = markets.at(exit_leg->index);
+            const auto& book = snapshot.at(exit_leg->index);
             if (!book || !fresh(*book)) { halt("No fresh book for initial position clear"); return; }
-            const Decimal quantity = down(amount, market.step), price = price_of(*book, false);
+            const Decimal price = price_of(*book, exit_leg->buy);
+            const Decimal quantity = down(exit_leg->buy ? amount / price : amount, market.step);
             if (quantity == 0 || quantity < market.min_qty || price * quantity < market.min_notional) {
                 dust[asset] += amount; amount = 0; continue;
             }
             if (++clear_orders > options.max_initial_clear_orders) { halt("Initial position clear limit reached"); return; }
-            auto order = prepare_from_book({*exit_index, false}, amount, true, snapshot);
+            auto order = prepare_from_book(*exit_leg, amount, true, snapshot);
             if (!order) { halt("Cannot clear initial position"); return; }
             send(*order); return;
         }

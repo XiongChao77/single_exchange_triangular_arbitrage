@@ -82,6 +82,20 @@ int main() {
         rejects([] { decode_best_bid_ask(nullptr, 0); });
         rejects([] { decode_best_bid_ask(nlohmann::json::array(), 0); });
 
+        nlohmann::json partial={{"stream","ethbtc@depth20@100ms"},{"data",{
+            {"lastUpdateId",160},{"bids",nlohmann::json::array()},{"asks",nlohmann::json::array()}}}};
+        for(int level=0;level<20;++level) {
+            partial["data"]["bids"].push_back({"0.04200001",std::to_string(20-level)+".00000"});
+            partial["data"]["asks"].push_back({"0.04200002",std::to_string(21+level)+".00000"});
+        }
+        const auto depth=decode_partial_depth(partial,54321);
+        check(depth.symbol=="ETHBTC" && depth.book_update_id==160 && depth.received_time_us==54321,
+              "Partial depth metadata failed");
+        check(depth.bid_levels==20 && depth.ask_levels==20 && depth.bid_price==4200001 && depth.ask_price==4200002,
+              "Partial depth top or level count failed");
+        check(depth.bids[19].qty==100000 && depth.asks[19].qty==4000000,
+              "Partial depth levels were not retained");
+
         const auto config_path = std::filesystem::temp_directory_path() / "triangular-json-config-test.json";
         auto load = [&](const nlohmann::json& value) {
             { std::ofstream file(config_path); file << value; }
@@ -122,33 +136,33 @@ int main() {
             metadata["symbols"].push_back({{"symbol", config.symbols[i]}, {"baseAsset", assets[i].first},
                 {"quoteAsset", assets[i].second}, {"status","TRADING"}, {"isSpotTradingAllowed",true}});
         config.trading_groups = validate_arbitrage(config, metadata);
-        auto check_usdt_paths = [&](const std::vector<TradeGroup>& groups) {
+        auto check_usdt_paths = [&](const std::vector<TradeGroup>& groups,
+                                    const std::vector<std::pair<std::string,std::string>>& market_assets) {
             check(groups.size() == 2, "Expected two triangle groups");
             for (const auto& group : groups) {
                 check(group.paths.size() == 2, "Expected two paths per group");
                 for (const auto& path : group.paths) {
-                    check(path.front().buy && !path.back().buy, "Must buy first and sell last");
                     std::string holding = "USDT";
                     for (const auto& leg : path) {
                         check(std::find(group.symbol_indices.begin(), group.symbol_indices.end(), leg.index) !=
                               group.symbol_indices.end(), "Path leg must belong to group");
-                        const auto& [base, quote] = assets.at(leg.index);
+                        const auto& [base, quote] = market_assets.at(leg.index);
                         check(holding == (leg.buy ? quote : base), "Leg spends an asset not held");
                         holding = leg.buy ? base : quote;
                     }
                     check(holding == "USDT", "Path must return to USDT");
                 }
                 check(group.paths[0][0].index != group.paths[1][0].index,
-                      "Paths must use different first purchases");
+                      "Paths must use different first conversions");
             }
         };
-        check_usdt_paths(config.trading_groups);
+        check_usdt_paths(config.trading_groups, assets);
         for (std::size_t group = 0; group < config.trading_groups.size(); ++group)
             check(config.trading_groups[group].symbol_indices == config.triangle_indices[group],
                   "Group symbols must match configured triangle");
         auto reordered = config;
         reordered.triangle_indices = {{2, 0, 1}, {4, 3, 2}};
-        check_usdt_paths(validate_arbitrage(reordered, metadata));
+        check_usdt_paths(validate_arbitrage(reordered, metadata), assets);
         auto unfunded = metadata;
         for (auto& market : unfunded["symbols"])
             if (market["quoteAsset"] == "USDT") market["quoteAsset"] = "USDC";
@@ -156,11 +170,27 @@ int main() {
         auto reversed_usdt = metadata;
         reversed_usdt["symbols"][1]["baseAsset"] = "USDT";
         reversed_usdt["symbols"][1]["quoteAsset"] = "ETH";
-        rejects([&] { validate_arbitrage(config, reversed_usdt); });
+        const auto reversed_groups = validate_arbitrage(config, reversed_usdt);
+        auto reversed_assets = assets;
+        reversed_assets[1] = {"USDT", "ETH"};
+        check_usdt_paths(reversed_groups, reversed_assets);
+        check(std::any_of(reversed_groups[0].paths.begin(), reversed_groups[0].paths.end(),
+              [&](const TradePath& path) { return path.front().index == 1 && !path.front().buy; }),
+              "USDT-base market must start with SELL");
         auto priced = [](const char* symbol, const char* bid, const char* ask) {
             return decode_best_bid_ask({{"s",symbol},{"u",1},{"b",bid},{"a",ask},{"B","10"},{"A","10"}}, 0);
         };
         ArbitrageOpportunity opportunity;
+        auto reversed_config = config;
+        reversed_config.commission_taker = 0;
+        reversed_config.edge_threshold = 0;
+        reversed_config.trading_groups = reversed_groups;
+        OrderBookManager reversed_edges(reversed_config);
+        reversed_edges.update(0, priced("ETHBTC", "2", "2.01"));
+        reversed_edges.update(1, priced("ETHUSDT", "2", "2.01"));
+        reversed_edges.update(2, priced("BTCUSDT", "2", "2.01"));
+        check(reversed_edges.scan_edge(1, opportunity) && opportunity.path.front().index == 1 &&
+              !opportunity.path.front().buy, "USDT-base SELL path was not scanned");
         OrderBookManager edges(config);
         check(!edges.scan_edge(0, opportunity), "Missing books must not signal");
         rejects([&] { edges.scan_edge(99, opportunity); });
@@ -276,7 +306,7 @@ int main() {
         producer.join();
         check(valid && concurrent.get(0)->book_update_id == 9999, "Concurrent orderbook read failed");
         check(stream_target({"ETHBTC", "ethbtc", "BTCUSDT"}) ==
-              "/stream?streams=ethbtc@bookTicker/ethbtc@bookTicker/btcusdt@bookTicker", "Stream URL failed");
+              "/stream?streams=ethbtc@depth20@100ms/ethbtc@depth20@100ms/btcusdt@depth20@100ms", "Stream URL failed");
         std::cout << "All orderbook tests passed\n";
         return 0;
     } catch (const std::exception& error) {

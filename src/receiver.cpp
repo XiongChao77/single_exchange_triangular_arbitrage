@@ -105,7 +105,8 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
     bool started = false;
 
     Impl(net::io_context& context, Config c, OrderBookManager& manager, AsyncLogger& log, std::function<void(const ArbitrageOpportunity&)> handler)
-        : io(context), config(std::move(c)), orderbooks(manager), logger(log), on_opportunity(std::move(handler)), retry(io), counts(config.symbols.size()) {
+        : io(context), config(std::move(c)), orderbooks(manager), logger(log), on_opportunity(std::move(handler)),
+          retry(io), counts(config.symbols.size()) {
         tls.set_default_verify_paths();
         if (!config.ca_file.empty()) tls.load_verify_file(config.ca_file.string());
         tls.set_verify_mode(ssl::verify_peer);
@@ -127,12 +128,17 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
         });
     }
 
-    void ingest(const nlohmann::json& message, std::size_t wire_bytes, std::int64_t start, std::int64_t received_time) {
+    void ingest(const nlohmann::json& message, std::size_t wire_bytes, std::int64_t start,
+                std::int64_t received_time, std::int64_t json_parse_ns = 0) {
         OrderBook orderbook;
         std::size_t index;
+        const auto decode_begin = steady_time_ns();
+        std::int64_t decode_end, lookup_end;
         try {
-            orderbook = decode_best_bid_ask(message, received_time);
+            orderbook = decode_partial_depth(message, received_time);
+            decode_end = steady_time_ns();
             index = orderbooks.index_of(orderbook.symbol);
+            lookup_end = steady_time_ns();
         } catch (const std::exception& error) {
             ++invalid;
             const auto now = Clock::now();
@@ -147,24 +153,14 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
         orderbook.receive_sequence = ++received;
         auto& count = counts[index];
         if (++count == 1) logger.log("INFO", "first_orderbook", {{"symbol", orderbook.symbol}});
-        if (!logger.log("INFO", "receiver_orderbook", {
-                {"receive_sequence", orderbook.receive_sequence},
-                {"symbol", orderbook.symbol},
-                {"event_time_us", orderbook.event_time_us ?
-                    nlohmann::json(*orderbook.event_time_us) : nlohmann::json(nullptr)},
-                {"received_time_us", orderbook.received_time_us},
-                {"book_update_id", orderbook.book_update_id},
-                {"price_exponent", orderbook.price_exponent},
-                {"qty_exponent", orderbook.qty_exponent},
-                {"bid_price", orderbook.bid_price},
-                {"bid_qty", orderbook.bid_qty},
-                {"ask_price", orderbook.ask_price},
-                {"ask_qty", orderbook.ask_qty},
-                {"wire_bytes", wire_bytes},
-                {"exchange_to_receive_us", nullptr}})) ++log_rejected;
+        const auto update_begin = steady_time_ns();
         orderbooks.update(index, std::move(orderbook));
+        const auto update_end = steady_time_ns();
         ArbitrageOpportunity opportunity;
-        if (orderbooks.scan_edge(index, opportunity)) {
+        const auto scan_begin = steady_time_ns();
+        const bool edge_found = orderbooks.scan_edge(index, opportunity);
+        const auto scan_end = steady_time_ns();
+        if (edge_found) {
             auto legs = nlohmann::json::array();
             for (std::size_t i = 0; i < opportunity.path.size(); ++i) {
                 const auto& leg = opportunity.path[i];
@@ -178,6 +174,22 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
                 {"net_return", opportunity.net_return}, {"legs", std::move(legs)}});
             if (on_opportunity) on_opportunity(opportunity);
         }
+        const auto processing_end = steady_time_ns();
+        // update() moves the symbol string; scalar fields remain available for logging.
+        if (!logger.log("INFO", "receiver_orderbook", {
+                {"receive_sequence", orderbook.receive_sequence}, {"symbol", config.symbols[index]},
+                {"event_time_us", orderbook.event_time_us ? nlohmann::json(*orderbook.event_time_us) : nlohmann::json(nullptr)},
+                {"received_time_us", orderbook.received_time_us}, {"book_update_id", orderbook.book_update_id},
+                {"price_exponent", orderbook.price_exponent}, {"qty_exponent", orderbook.qty_exponent},
+                {"bid_price", orderbook.bid_price}, {"bid_qty", orderbook.bid_qty},
+                {"ask_price", orderbook.ask_price}, {"ask_qty", orderbook.ask_qty},
+                {"bid_levels", orderbook.bid_levels}, {"ask_levels", orderbook.ask_levels},
+                {"wire_bytes", wire_bytes}, {"exchange_to_receive_us", nullptr},
+                {"json_parse_ns", json_parse_ns}, {"depth_decode_ns", decode_end - decode_begin},
+                {"symbol_lookup_ns", lookup_end - decode_end}, {"book_update_ns", update_end - update_begin},
+                {"scan_edge_ns", scan_end - scan_begin},
+                {"opportunity_ns", edge_found ? processing_end - scan_end : 0},
+                {"processing_before_log_ns", processing_end - start}, {"edge_found", edge_found}})) ++log_rejected;
         const auto elapsed = static_cast<std::uint64_t>(steady_time_ns() - start);
         total_ingest_ns += elapsed;
         max_ingest_ns = std::max(max_ingest_ns, elapsed);
@@ -271,14 +283,16 @@ struct Receiver::Impl::Session : std::enable_shared_from_this<Session> {
             if (self->ws.got_text()) {
                 const auto bytes = self->buffer.data();
                 const auto* data = static_cast<const char*>(bytes.data());
+                const auto parse_begin = steady_time_ns();
                 const auto message = nlohmann::json::parse(data, data + bytes.size(), nullptr, false);
+                const auto parse_ns = steady_time_ns() - parse_begin;
                 const auto& control = message.is_object() && message.contains("data") ? message["data"] : message;
                 if (control.is_object() && control.contains("e") && control["e"] == "serverShutdown")
                     return self->fail("serverShutdown", net::error::connection_reset);
                 if (message.is_object() && message.contains("code"))
                     return self->fail("stream_control_error", net::error::access_denied);
                 if (!(message.is_object() && message.contains("result") && message["result"].is_null() && message.contains("id")))
-                    impl->ingest(message, bytes.size(), start, received_time);
+                    impl->ingest(message, bytes.size(), start, received_time, parse_ns);
             } else {
                 // A binary frame is not a JSON market-data message.
                 impl->ingest(nullptr, self->buffer.size(), start, received_time);
