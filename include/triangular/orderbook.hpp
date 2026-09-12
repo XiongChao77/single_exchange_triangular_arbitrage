@@ -1,0 +1,116 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <unordered_map>
+#include <filesystem>
+#include <mutex>
+#include <optional>
+#include <nlohmann/json_fwd.hpp>
+#include <string>
+#include <vector>
+
+namespace triangular {
+
+struct TradeLeg {
+    std::size_t index;
+    bool buy; // Quote -> base at ask; otherwise base -> quote at bid.
+};
+using TradePath = std::array<TradeLeg, 3>;
+
+struct TradeGroup {
+    std::array<std::size_t, 3> symbol_indices;
+    std::array<TradePath, 2> paths; // Both start and end in USDT.
+};
+
+// Indicative top-of-book plan, before exchange filters/rounding and actual fills.
+struct ArbitrageOpportunity {
+    std::size_t group_index{};
+    TradePath path{};
+    std::array<long double, 3> prices{}; // Quote asset per base asset.
+    std::array<long double, 3> quantities{}; // Base asset, before commission, BUY and SELL alike.
+    std::array<std::int64_t, 3> book_update_ids{};
+    std::array<std::int64_t, 3> received_steady_ns{};
+    long double input_usdt{};
+    long double output_usdt{};
+    long double profit_usdt{};
+    long double net_return{};
+};
+
+struct Config {
+    std::string execution_mode = "disabled"; // disabled, paper, or live.
+    bool live_test_mode = false; // When true, accept at most 10 live arbitrage cycles per process.
+    std::filesystem::path api_key_file;
+    std::filesystem::path secret_key_file;
+    std::uint64_t execution_timeout_ms = 1000;
+    double max_arbitrage_usdt = 100.0; // Maximum initial USDT per triangle execution.
+    double commission_taker = 0.0005;
+    double edge_threshold = 0.0001; // Net return ratio, not percent.
+    std::vector<TradeGroup> trading_groups;
+    std::string host = "stream.binance.com";
+    std::string port = "9443";
+    std::filesystem::path ca_file;
+    std::string rest_host = "api.binance.com";
+    std::string rest_port = "443";
+    std::vector<std::string> symbols; // Unique symbols in first-appearance order.
+    std::unordered_map<std::string, std::size_t> symbol_indices;
+    std::vector<std::array<std::size_t, 3>> triangle_indices;
+};
+
+Config load_config(const std::filesystem::path& path);
+std::vector<TradeGroup> validate_arbitrage(const Config& config, const nlohmann::json& exchange_info);
+std::string stream_target(const std::vector<std::string>& symbols);
+
+// Simplified order book storing only the best bid and ask.
+// Decimal value = mantissa * 10^exponent; no floating-point rounding on ingestion.
+struct OrderBook {
+    std::string symbol;
+    std::optional<std::int64_t> event_time_us; // Unavailable in Spot bookTicker.
+    std::int64_t received_time_us{};
+    std::int64_t received_steady_ns{};
+    std::uint64_t receive_sequence{};
+    std::int64_t book_update_id{};
+    std::int8_t price_exponent{};
+    std::int8_t qty_exponent{};
+    std::int64_t bid_price{};
+    std::int64_t bid_qty{};
+    std::int64_t ask_price{};
+    std::int64_t ask_qty{};
+};
+
+OrderBook decode_best_bid_ask(const nlohmann::json& message,
+                             std::int64_t received_time_us);
+
+struct OrderBookStats {
+    std::size_t symbols;
+    std::size_t populated;
+    std::uint64_t received;
+};
+
+// Fixed slots after construction. Reads return copies protected by the same lock
+// as updates, so readers never observe partially written orderbooks.
+class OrderBookManager {
+public:
+    explicit OrderBookManager(const Config& config);
+    std::size_t index_of(const std::string& symbol) const;
+    void update(std::size_t index, OrderBook orderbook);
+    // Scan both paths of each group containing the updated symbol index.
+    // Returns the first qualifying path; clears result when no opportunity exists.
+    bool scan_edge(std::size_t index, ArbitrageOpportunity& result);
+    std::optional<OrderBook> get(std::size_t index) const;
+    std::vector<std::optional<OrderBook>> snapshot() const;
+    OrderBookStats stats() const;
+private:
+    std::unordered_map<std::string, std::size_t> indices_;
+    mutable std::mutex mutex_;
+    std::vector<std::optional<OrderBook>> orderbooks_;
+    std::vector<TradeGroup> groups_;
+    long double max_arbitrage_usdt_;
+    long double fee_multiplier_;
+    long double edge_threshold_;
+    std::size_t populated_ = 0;
+    std::uint64_t received_ = 0;
+};
+
+} // namespace triangular

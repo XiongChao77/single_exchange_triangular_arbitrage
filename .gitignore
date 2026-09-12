@@ -5,5 +5,7 @@ __pycache__/
 *.pem
 *api_key*
 *api_secret*
+*secret_key*
+*.key
 *.log
-/tests/
+build*

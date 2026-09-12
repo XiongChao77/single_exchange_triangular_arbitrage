@@ -1,16 +1,20 @@
 #pragma once
 
-#include "triangular/core.hpp"
+#include "triangular/orderbook.hpp"
 #include "triangular/logger.hpp"
 #include <boost/asio/io_context.hpp>
 #include <memory>
+#include <functional>
 
 namespace triangular {
 
-// Call start/stop on the io_context thread. QuoteQueue inspection is thread-safe.
+nlohmann::json fetch_exchange_info(const Config& config);
+
+// Call start/stop on the io_context thread. OrderBookManager inspection is thread-safe.
 class Receiver {
 public:
-    Receiver(boost::asio::io_context& io, Config config, std::string api_key, QuoteQueue& queue, AsyncLogger& logger);
+    Receiver(boost::asio::io_context& io, Config config, OrderBookManager& orderbooks, AsyncLogger& logger,
+             std::function<void(const ArbitrageOpportunity&)> on_opportunity = {});
     ~Receiver();
     Receiver(const Receiver&) = delete;
     Receiver& operator=(const Receiver&) = delete;

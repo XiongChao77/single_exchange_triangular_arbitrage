@@ -1,5 +1,5 @@
 #include "triangular/receiver.hpp"
-#include "triangular/consumer.hpp"
+#include "triangular/execution/execution.hpp"
 
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -9,40 +9,62 @@
 
 namespace {
 const std::filesystem::path kConfigPath = "configs/binance.json";
-constexpr std::size_t kRunSeconds = 10; // Zero runs until SIGINT or SIGTERM.
-constexpr std::size_t kQuotesPerSymbol = 10;
 const std::filesystem::path kLogDirectory = "logs";
 constexpr std::size_t kLogQueueCapacity = 65536;
 constexpr std::size_t kLogBatchThreshold = 256;
 constexpr std::chrono::milliseconds kLogFlushInterval{1000};
 constexpr std::chrono::seconds kStatisticsInterval{1};
-static_assert(kQuotesPerSymbol > 0);
 }
 
 int main() {
     try {
-        auto config = triangular::load_config(std::filesystem::absolute(kConfigPath));
-        const std::size_t queue_capacity = config.symbols.size() * kQuotesPerSymbol;
-        auto key = triangular::load_api_key(config.api_key_file);
-        triangular::QuoteQueue queue(queue_capacity);
-        const auto log_path = kLogDirectory / ("sbe-" + std::to_string(triangular::wall_time_us()) + ".jsonl");
+        auto config = triangular::load_config(std::filesystem::exists(kConfigPath) ?
+            std::filesystem::absolute(kConfigPath) :
+            std::filesystem::path("/root/work/single_exchange_triangular_arbitrage/configs/binance.json"));
+        const auto exchange_info = triangular::fetch_exchange_info(config);
+        config.trading_groups = triangular::validate_arbitrage(config, exchange_info);
+        triangular::OrderBookManager orderbooks(config);
+        const auto log_path = kLogDirectory / ("json-" + std::to_string(triangular::wall_time_us()) + ".jsonl");
         triangular::AsyncLogger logger(log_path, {kLogQueueCapacity, kLogBatchThreshold, kLogFlushInterval});
-        logger.log("INFO", "run_started", {{"quote_capacity", queue_capacity}, {"symbols", config.symbols},
-            {"run_seconds", kRunSeconds}, {"log_capacity", kLogQueueCapacity},
+        logger.log("INFO", "run_started", {{"orderbook_slots", orderbooks.stats().symbols}, {"symbols", config.symbols},
+            {"triangle_indices", config.triangle_indices}, {"execution_mode", config.execution_mode},
+            {"live_test_mode", config.live_test_mode},
+            {"log_capacity", kLogQueueCapacity},
             {"log_batch_threshold", kLogBatchThreshold}, {"log_flush_interval_ms", kLogFlushInterval.count()}});
         std::cerr << "INFO log_file=" << log_path.string() << '\n';
-        triangular::QuoteConsumer consumer(queue, logger);
         boost::asio::io_context io;
-        triangular::Receiver receiver(io, std::move(config), std::move(key), queue, logger);
+        std::unique_ptr<triangular::execution::Gateway> gateway;
+        std::unique_ptr<triangular::execution::ArbitrageExecutor> executor;
+        if (config.execution_mode == "paper" || config.execution_mode == "live") {
+            auto markets = triangular::execution::load_markets(config, exchange_info);
+            triangular::execution::Options options;
+            options.execution_timeout = std::chrono::milliseconds(config.execution_timeout_ms);
+            if (config.execution_mode == "paper") {
+                gateway = std::make_unique<triangular::execution::PaperGateway>(io, orderbooks, markets,
+                    triangular::execution::Decimal(config.commission_taker),
+                    triangular::execution::Balances{{"USDT", triangular::execution::Decimal(config.max_arbitrage_usdt)}});
+            } else {
+                gateway = std::make_unique<triangular::execution::BinanceGateway>(io, config, markets);
+                if (config.live_test_mode) options.max_cycles = 2;
+            }
+            executor = std::make_unique<triangular::execution::ArbitrageExecutor>(io, config, orderbooks,
+                std::move(markets), *gateway, options, [&](const nlohmann::json& status) {
+                    logger.log("INFO", "execution_state", status);
+                });
+        }
+        triangular::Receiver receiver(io, std::move(config), orderbooks, logger,
+            [&](const triangular::ArbitrageOpportunity& opportunity) {
+                if (executor) executor->try_start(opportunity);
+            });
         boost::asio::signal_set signals(io, SIGINT, SIGTERM);
         boost::asio::steady_timer duration(io);
         boost::asio::steady_timer statistics(io);
         auto report = [&](const char* event) {
-            const auto q = queue.stats();
+            const auto orderbook_stats = orderbooks.stats();
             const auto l = logger.stats();
-            logger.log("INFO", event, {{"quote_queue", {{"received", q.received}, {"consumed", q.consumed},
-                    {"queued", q.size}, {"capacity", q.capacity}, {"high_water", q.high_water}, {"dropped", q.dropped}}},
-                {"receiver", receiver.stats()}, {"consumer", consumer.stats()},
+            logger.log("INFO", event, {{"orderbook_store", {{"received", orderbook_stats.received},
+                    {"symbols", orderbook_stats.symbols}, {"populated", orderbook_stats.populated}}},
+                {"receiver", receiver.stats()},
                 {"logger", {{"queued", l.queued}, {"in_flight", l.in_flight}, {"high_water", l.high_water},
                     {"dropped", l.dropped}, {"written", l.written}, {"max_write_us", l.max_write_us},
                     {"max_enqueue_ns", l.max_enqueue_ns}, {"max_lock_wait_ns", l.max_lock_wait_ns}, {"failed", l.failed}}}});
@@ -55,29 +77,44 @@ int main() {
             });
         };
         auto stop = [&] {
+            if (executor) executor->stop();
             receiver.stop();
             signals.cancel();
             duration.cancel();
             statistics.cancel();
         };
         signals.async_wait([&](boost::system::error_code ec, int) { if (!ec) stop(); });
-        if (kRunSeconds) {
-            duration.expires_after(std::chrono::seconds(kRunSeconds));
-            duration.async_wait([&](boost::system::error_code ec) { if (!ec) stop(); });
-        }
         receiver.start();
         schedule_statistics();
         io.run();
-        consumer.stop(); // Drain accepted quotes before stopping the log writer.
+        const auto latest = orderbooks.snapshot();
+        for (std::size_t index = 0; index < latest.size(); ++index) {
+            if (!latest[index]) continue;
+            const auto& orderbook = *latest[index];
+            logger.log("INFO", "latest_orderbook", {
+                {"receive_sequence", orderbook.receive_sequence},
+                {"symbol", orderbook.symbol},
+                {"event_time_us", orderbook.event_time_us ?
+                    nlohmann::json(*orderbook.event_time_us) : nlohmann::json(nullptr)},
+                {"received_time_us", orderbook.received_time_us},
+                {"book_update_id", orderbook.book_update_id},
+                {"price_exponent", orderbook.price_exponent},
+                {"qty_exponent", orderbook.qty_exponent},
+                {"bid_price", orderbook.bid_price},
+                {"bid_qty", orderbook.bid_qty},
+                {"ask_price", orderbook.ask_price},
+                {"ask_qty", orderbook.ask_qty},
+                {"index", index}});
+        }
+        if (executor) logger.log("INFO", "execution_final", executor->stats());
         report("pipeline_final");
         logger.stop();
-        const auto q = queue.stats();
+        const auto orderbook_stats = orderbooks.stats();
         const auto l = logger.stats();
-        std::cerr << "INFO finished received=" << q.received << " consumed=" << q.consumed
-                  << " quote_dropped=" << q.dropped << " log_written=" << l.written
+        std::cerr << "INFO finished received=" << orderbook_stats.received << " populated=" << orderbook_stats.populated << " log_written=" << l.written
                   << " log_dropped=" << l.dropped << " log_write_lost=" << l.write_lost
                   << " logger_failed=" << l.failed << '\n';
-        return l.failed || consumer.stats().at("failed").get<bool>() ? 1 : 0;
+        return l.failed || (executor && executor->busy()) ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "ERROR " << error.what() << '\n';
         return 1;

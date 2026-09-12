@@ -1,6 +1,17 @@
 {
-  "host": "stream-sbe.binance.com",
-  "port": "443",
-  "api_key_file": "../../systematic-trading-platform/LiveTrading/binance/quant0/binance_api_key",
-  "symbols": ["ETHBTC", "ETHUSDT", "BTCUSDT", "BNBBTC", "BNBUSDT"]
+  "host": "stream.binance.com",
+  "port": "9443",
+  "triangles": [
+    ["ETHBTC", "ETHUSDT", "BTCUSDT"],
+    ["BTCUSDT", "BNBBTC", "BNBUSDT"]
+  ],
+  "execution_mode": "paper",
+  "live_test_mode": true,
+  "api_key_file": "/root/work/systematic-trading-platform/LiveTrading/binance/main/hmac_api_key",
+  "secret_key_file": "/root/work/systematic-trading-platform/LiveTrading/binance/main/hmac_secret",
+  "execution_timeout_ms": 1000,
+  "max_arbitrage_usdt": 20,
+  "commission_taker": 0.0001,
+  "commission_maker": 0.0001,
+  "edge_threshold":  0.0001
 }
