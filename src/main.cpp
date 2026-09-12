@@ -52,7 +52,7 @@ int main() {
                     logger.log("INFO", "execution_state", status);
                 });
         }
-        triangular::Receiver receiver(io, std::move(config), orderbooks, logger,
+        triangular::Receiver receiver(std::move(config), orderbooks, logger,
             [&](const triangular::ArbitrageOpportunity& opportunity) {
                 if (executor) executor->try_start(opportunity);
             });
@@ -86,7 +86,12 @@ int main() {
         signals.async_wait([&](boost::system::error_code ec, int) { if (!ec) stop(); });
         receiver.start();
         schedule_statistics();
-        io.run();
+        // Busy polling avoids a cross-thread wakeup for every market message.
+        // Bounded batches give order replies, signals and timers regular service.
+        while (!io.stopped()) {
+            io.poll();
+            receiver.process(32);
+        }
         const auto latest = orderbooks.snapshot();
         for (std::size_t index = 0; index < latest.size(); ++index) {
             if (!latest[index]) continue;

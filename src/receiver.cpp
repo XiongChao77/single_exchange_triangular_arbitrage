@@ -13,6 +13,11 @@
 #include <algorithm>
 #include <chrono>
 #include <unordered_map>
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <thread>
+#include <boost/asio/post.hpp>
 
 namespace triangular {
 namespace net = boost::asio;
@@ -88,7 +93,26 @@ nlohmann::json fetch_exchange_info(const Config& config) {
 
 struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
     struct Session;
-    net::io_context& io;
+    // Network state belongs to network_thread; books and execution stay on the caller thread.
+    net::io_context io;
+    std::thread network_thread;
+    static constexpr std::size_t queue_capacity = 1024;
+    static constexpr std::size_t max_message_bytes = 16 * 1024;
+    struct RawMessage {
+        std::array<char, max_message_bytes> payload;
+        std::size_t size = 0;
+        std::int64_t received_ns = 0, received_us = 0, published_ns = 0;
+        std::uint64_t sequence = 0;
+        bool text = true;
+        std::weak_ptr<Session> source;
+    };
+    std::array<RawMessage, queue_capacity> queue;
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    alignas(64) std::atomic<std::uint64_t> write_index{0};
+    alignas(64) std::atomic<std::uint64_t> read_index{0};
+    std::atomic<std::uint64_t> wire_received{0}, queue_full{0}, oversized{0}, high_water{0};
+    std::uint64_t total_queue_wait_ns = 0, max_queue_wait_ns = 0;
+    bool processing_stopped = false;
     Config config;
     OrderBookManager& orderbooks;
     AsyncLogger& logger;
@@ -104,8 +128,8 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
     bool stopped = false;
     bool started = false;
 
-    Impl(net::io_context& context, Config c, OrderBookManager& manager, AsyncLogger& log, std::function<void(const ArbitrageOpportunity&)> handler)
-        : io(context), config(std::move(c)), orderbooks(manager), logger(log), on_opportunity(std::move(handler)),
+    Impl(Config c, OrderBookManager& manager, AsyncLogger& log, std::function<void(const ArbitrageOpportunity&)> handler)
+        : config(std::move(c)), orderbooks(manager), logger(log), on_opportunity(std::move(handler)),
           retry(io), counts(config.symbols.size()) {
         tls.set_default_verify_paths();
         if (!config.ca_file.empty()) tls.load_verify_file(config.ca_file.string());
@@ -116,6 +140,7 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
 
     void connect();
     void stop();
+    void process(std::size_t max_batch);
     void disconnected(const std::string& stage, Error ec, unsigned status = 0) {
         if (stopped) return;
         session.reset();
@@ -129,7 +154,8 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
     }
 
     void ingest(const nlohmann::json& message, std::size_t wire_bytes, std::int64_t start,
-                std::int64_t received_time, std::int64_t json_parse_ns = 0) {
+                std::int64_t received_time, std::int64_t json_parse_ns,
+                std::uint64_t sequence, std::int64_t queue_wait_ns) {
         OrderBook orderbook;
         std::size_t index;
         const auto decode_begin = steady_time_ns();
@@ -148,9 +174,9 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
             }
             return;
         }
-        retry_seconds = 1;
         orderbook.received_steady_ns = start;
-        orderbook.receive_sequence = ++received;
+        orderbook.receive_sequence = sequence;
+        ++received;
         auto& count = counts[index];
         if (++count == 1) logger.log("INFO", "first_orderbook", {{"symbol", orderbook.symbol}});
         const auto update_begin = steady_time_ns();
@@ -185,6 +211,8 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
                 {"ask_price", orderbook.ask_price}, {"ask_qty", orderbook.ask_qty},
                 {"bid_levels", orderbook.bid_levels}, {"ask_levels", orderbook.ask_levels},
                 {"wire_bytes", wire_bytes}, {"exchange_to_receive_us", nullptr},
+                {"queue_wait_ns", queue_wait_ns},
+                {"receive_to_decision_ns", scan_end - start},
                 {"json_parse_ns", json_parse_ns}, {"depth_decode_ns", decode_end - decode_begin},
                 {"symbol_lookup_ns", lookup_end - decode_end}, {"book_update_ns", update_end - update_begin},
                 {"scan_edge_ns", scan_end - scan_begin},
@@ -280,23 +308,30 @@ struct Receiver::Impl::Session : std::enable_shared_from_this<Session> {
             if (!impl || impl->stopped) return self->cancel();
             const auto start = steady_time_ns();
             const auto received_time = wall_time_us();
-            if (self->ws.got_text()) {
-                const auto bytes = self->buffer.data();
-                const auto* data = static_cast<const char*>(bytes.data());
-                const auto parse_begin = steady_time_ns();
-                const auto message = nlohmann::json::parse(data, data + bytes.size(), nullptr, false);
-                const auto parse_ns = steady_time_ns() - parse_begin;
-                const auto& control = message.is_object() && message.contains("data") ? message["data"] : message;
-                if (control.is_object() && control.contains("e") && control["e"] == "serverShutdown")
-                    return self->fail("serverShutdown", net::error::connection_reset);
-                if (message.is_object() && message.contains("code"))
-                    return self->fail("stream_control_error", net::error::access_denied);
-                if (!(message.is_object() && message.contains("result") && message["result"].is_null() && message.contains("id")))
-                    impl->ingest(message, bytes.size(), start, received_time, parse_ns);
+            const auto bytes = self->buffer.data();
+            const auto sequence = impl->wire_received.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto write = impl->write_index.load(std::memory_order_relaxed);
+            const auto read = impl->read_index.load(std::memory_order_acquire);
+            if (bytes.size() > max_message_bytes) {
+                impl->oversized.fetch_add(1, std::memory_order_relaxed);
+            } else if (write - read == queue_capacity) {
+                impl->queue_full.fetch_add(1, std::memory_order_relaxed);
             } else {
-                // A binary frame is not a JSON market-data message.
-                impl->ingest(nullptr, self->buffer.size(), start, received_time);
+                auto& slot = impl->queue[write % queue_capacity];
+                std::memcpy(slot.payload.data(), bytes.data(), bytes.size());
+                slot.size = bytes.size();
+                slot.received_ns = start;
+                slot.received_us = received_time;
+                slot.sequence = sequence;
+                slot.text = self->ws.got_text();
+                slot.source = self;
+                slot.published_ns = steady_time_ns();
+                impl->write_index.store(write + 1, std::memory_order_release);
+                const auto depth = write + 1 - read;
+                if (depth > impl->high_water.load(std::memory_order_relaxed))
+                    impl->high_water.store(depth, std::memory_order_relaxed);
             }
+            impl->retry_seconds = 1;
             self->buffer.consume(self->buffer.size());
             self->read();
         });
@@ -308,32 +343,75 @@ void Receiver::Impl::connect() {
     session = std::make_shared<Session>(shared_from_this());
     session->start();
 }
+void Receiver::Impl::process(std::size_t max_batch) {
+    if (processing_stopped) return;
+    for (std::size_t n = 0; n < max_batch; ++n) {
+        const auto read = read_index.load(std::memory_order_relaxed);
+        if (read == write_index.load(std::memory_order_acquire)) break;
+        auto& slot = queue[read % queue_capacity];
+        const auto parse_begin = steady_time_ns();
+        const auto wait_ns = parse_begin - slot.published_ns;
+        total_queue_wait_ns += static_cast<std::uint64_t>(wait_ns);
+        max_queue_wait_ns = std::max(max_queue_wait_ns, static_cast<std::uint64_t>(wait_ns));
+        const auto message = slot.text
+            ? nlohmann::json::parse(slot.payload.data(), slot.payload.data() + slot.size, nullptr, false)
+            : nlohmann::json();
+        const auto parse_ns = steady_time_ns() - parse_begin;
+        const auto& control = message.is_object() && message.contains("data") ? message["data"] : message;
+        const bool shutdown = control.is_object() && control.contains("e") && control["e"] == "serverShutdown";
+        const bool error = message.is_object() && message.contains("code");
+        if (shutdown || error) {
+            net::post(io, [source = slot.source, shutdown] {
+                if (auto connection = source.lock())
+                    connection->fail(shutdown ? "serverShutdown" : "stream_control_error", net::error::connection_reset);
+            });
+        } else if (!(message.is_object() && message.contains("result") && message["result"].is_null() && message.contains("id"))) {
+            ingest(message, slot.size, slot.received_ns, slot.received_us, parse_ns, slot.sequence, wait_ns);
+        }
+        slot.source.reset();
+        read_index.store(read + 1, std::memory_order_release);
+    }
+}
 void Receiver::Impl::stop() {
-    if (stopped) return;
-    stopped = true;
-    retry.cancel();
-    if (session) session->cancel();
-    // Release the closed WebSocket after its canceled handlers complete, so its
-    // internal idle timer cannot keep io_context alive until the old deadline.
-    session.reset();
+    if (processing_stopped) return;
+    if (network_thread.joinable()) {
+        net::post(io, [this] {
+            stopped = true;
+            retry.cancel();
+            if (session) session->cancel();
+            session.reset();
+        });
+        network_thread.join();
+    }
+    process(queue_capacity); // Producer is joined; consume the remaining snapshots.
+    processing_stopped = true;
     const auto s = orderbooks.stats();
     logger.log("INFO", "receiver_stopped", {{"received", s.received}, {"symbols", s.symbols},
         {"populated", s.populated}, {"invalid", invalid}});
     for (std::size_t index = 0; index < counts.size(); ++index)
         logger.log("INFO", "symbol_summary", {{"symbol", config.symbols[index]}, {"received", counts[index]}});
 }
-Receiver::Receiver(net::io_context& io, Config config, OrderBookManager& orderbooks, AsyncLogger& logger,
+Receiver::Receiver(Config config, OrderBookManager& orderbooks, AsyncLogger& logger,
                    std::function<void(const ArbitrageOpportunity&)> on_opportunity)
-    : impl_(std::make_shared<Impl>(io, std::move(config), orderbooks, logger, std::move(on_opportunity))) {}
+    : impl_(std::make_shared<Impl>(std::move(config), orderbooks, logger, std::move(on_opportunity))) {}
 Receiver::~Receiver() { impl_->stop(); }
 void Receiver::start() {
-    if (impl_->started || impl_->stopped) return;
+    if (impl_->started || impl_->processing_stopped) return;
     impl_->started = true;
     impl_->connect();
+    impl_->network_thread = std::thread([impl = impl_] { impl->io.run(); });
 }
 void Receiver::stop() { impl_->stop(); }
+void Receiver::process(std::size_t max_batch) { impl_->process(max_batch); }
 nlohmann::json Receiver::stats() const {
-    return {{"received", impl_->received}, {"invalid", impl_->invalid},
+    return {{"wire_received", impl_->wire_received.load(std::memory_order_relaxed)},
+        {"queue_capacity", Impl::queue_capacity},
+        {"queue_depth", impl_->write_index.load(std::memory_order_acquire) - impl_->read_index.load(std::memory_order_relaxed)},
+        {"queue_high_watermark", impl_->high_water.load(std::memory_order_relaxed)},
+        {"queue_full_total", impl_->queue_full.load(std::memory_order_relaxed)},
+        {"oversized_total", impl_->oversized.load(std::memory_order_relaxed)},
+        {"total_queue_wait_ns", impl_->total_queue_wait_ns}, {"max_queue_wait_ns", impl_->max_queue_wait_ns},
+        {"received", impl_->received}, {"invalid", impl_->invalid},
         {"total_ingest_ns", impl_->total_ingest_ns}, {"max_ingest_ns", impl_->max_ingest_ns},
         {"avg_ingest_ns", impl_->received == 0 ? 0.0 :
             static_cast<double>(impl_->total_ingest_ns) / static_cast<double>(impl_->received)},

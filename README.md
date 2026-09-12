@@ -23,13 +23,8 @@ On Ubuntu these are provided by `cmake g++ libboost-dev libssl-dev
 nlohmann-json3-dev python3`; the tests also use the `openssl` command.
 
 ```bash
-cmake -S . -B build-debug -DBUILD_TESTING=OFF
-cmake --build build-debug -j 2
-
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j2
-ctest --test-dir build --output-on-failure
-./build/json_receiver
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build-release -j2
 ```
 # Debug version
 cd single_exchange_triangular_arbitrage
@@ -111,8 +106,18 @@ Readers use precomputed indices with `get(index)`, or copy all slots under one
 lock with `snapshot()` to obtain a consistent local view. Empty slots mean no
 orderbook has arrived yet. Slot replacement retains arrival order, not a historical
 queue. Order books are retained across reconnects; readers must check their receive
-timestamps before using them. There is no orderbook consumer thread. The asynchronous
-logger retains its own queue for disk I/O. Shutdown logs one `latest_orderbook` per
+timestamps before using them. A dedicated network thread reads complete WebSocket messages
+and publishes them to a preallocated, bounded SPSC ring (1024 slots, 16 KiB per message).
+The main thread busy-polls this lock-free queue in batches of at most 32, parses JSON,
+updates books, scans edges, and services executor callbacks through its own `io_context`.
+Queue publication uses release/acquire atomics; message storage is not reused until consumption
+completes. A full queue drops the new snapshot; oversized messages are also dropped.
+`queue_full_total`, `oversized_total`, `queue_depth`, and `queue_high_watermark` expose overload.
+Receive sequence numbers include dropped messages. `queue_wait_ns` measures publication-to-parse
+waiting, and `receive_to_decision_ns` includes queue waiting and processing. Book freshness
+continues to use the original network receive timestamp. Busy polling consumes a CPU core.
+Shutdown joins the network thread and consumes remaining queued snapshots before final statistics.
+The asynchronous logger retains its own queue for disk I/O. Shutdown logs one `latest_orderbook` per
 populated slot, including its index.
 
 Metadata reference: [Binance exchangeInfo](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#exchange-information).
@@ -155,7 +160,8 @@ configuration), or `live`. Paper mode uses a simulated USDT wallet seeded with `
 consumes top-of-book liquidity locally, and never calls private Binance APIs. It does not
 model queue position, network latency or hidden depth and must not be treated as a live PnL estimate.
 
-All receiver/executor/gateway callbacks run on the same single `io_context` thread. One
+Market parsing, scanning, executor state changes, and gateway result callbacks run on the
+main thread; market WebSocket callbacks run on a dedicated network `io_context` thread. One
 `ArbitrageExecutor` admits only one cycle globally; shared symbols across groups are allowed,
 and busy-time opportunities are discarded. Before a cycle, related non-USDT balances are sold
 through the group's USDT markets with IOC orders. The three arbitrage legs then run sequentially

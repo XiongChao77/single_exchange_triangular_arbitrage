@@ -79,6 +79,7 @@ def main():
                 upgrade(stream,expected)
                 for symbol in SYMBOLS: stream.sendall(frame(1,depth_event(symbol,101)))
                 stream.sendall(frame(1,depth_event("BTCUSDT",102)))
+                for update in range(103,2303): stream.sendall(frame(1,depth_event("BTCUSDT",update)))
                 stream.sendall(frame(9,b"processed")); assert read_frame(stream)==(10,b"processed")
                 complete.set()
                 try: stream.recv(1)
@@ -97,17 +98,27 @@ def main():
             rows=[json.loads(line) for line in max((root/"logs").glob("*.jsonl")).read_text().splitlines()]
             events=lambda name:[row["fields"] for row in rows if row["event"]==name]
             final=events("pipeline_final")[0]
-            assert final["orderbook_store"]=={"received":6,"symbols":5,"populated":5},final
+            count=final["orderbook_store"]["received"]
+            assert final["orderbook_store"]=={"received":count,"symbols":5,"populated":5},final
             received=events("receiver_orderbook")
-            assert len(received)==6 and all(row["bid_levels"]==20 and row["ask_levels"]==20 for row in received)
+            assert len(received)==count and all(row["bid_levels"]==20 and row["ask_levels"]==20 for row in received)
             assert all(row["event_time_us"] is None for row in received)
-            timing_fields=("json_parse_ns","depth_decode_ns","symbol_lookup_ns","book_update_ns","scan_edge_ns","opportunity_ns")
+            timing_fields=("json_parse_ns","depth_decode_ns","symbol_lookup_ns","book_update_ns","scan_edge_ns","opportunity_ns","queue_wait_ns")
             for row in received:
                 assert all(row[field]>=0 for field in timing_fields),row
                 assert row["processing_before_log_ns"]>=sum(row[field] for field in timing_fields),row
                 assert isinstance(row["edge_found"],bool)
+            receiver_stats=final["receiver"]
+            assert receiver_stats["wire_received"]==2206,receiver_stats
+            assert receiver_stats["oversized_total"]==0,receiver_stats
+            assert count+receiver_stats["queue_full_total"]==2206,receiver_stats
+            assert receiver_stats["queue_depth"]==0,receiver_stats
+            assert 1<=receiver_stats["queue_high_watermark"]<=receiver_stats["queue_capacity"],receiver_stats
+            sequences=[row["receive_sequence"] for row in received]
+            assert sequences==sorted(set(sequences)),sequences
+            assert all(row["receive_to_decision_ns"]>=row["queue_wait_ns"]+row["json_parse_ns"]+row["scan_edge_ns"] for row in received)
             latest=events("latest_orderbook"); assert len(latest)==5
-            assert next(row for row in latest if row["symbol"]=="BTCUSDT")["book_update_id"]==102
+            assert next(row for row in latest if row["symbol"]=="BTCUSDT")["book_update_id"]==max(row["book_update_id"] for row in received if row["symbol"]=="BTCUSDT")
         finally:
             if process.poll() is None: process.kill(); process.communicate()
             listener.close()
