@@ -1,5 +1,7 @@
 # Local replay measurement
 
+See [external_capture.md](external_capture.md) for external bidirectional capture, TLS decryption, and market/order correlation. The offline entry point is `match_capture.py`; it locates business messages but does not treat reassembled presentation frames as exact wire boundaries.
+
 `replay_benchmark.py` records public Binance 20-level partial-depth messages and market metadata. It runs a local TLS REST/WebSocket server, replays one recording to each receiver sequentially, and saves every sender timestamp, receiver log, missing sequence, and latency distribution. Orders are disabled.
 
 The main and lock-free branches contain identical `replay_decision` instrumentation in `receiver.cpp`. It is enabled only by `TRIANGULAR_REPLAY=1` (set by the runner). Python `time.monotonic_ns()` and C++ `steady_clock` must use the same clock epoch on the same Linux host; the runner checks timestamp ordering. Do not copy timing fields to another host.

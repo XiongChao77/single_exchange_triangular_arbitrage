@@ -1,5 +1,6 @@
 #include "triangular/execution/execution.hpp"
 #include "triangular/logger.hpp"
+#include "triangular/timestamp_stream.hpp"
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <algorithm>
@@ -113,6 +114,7 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     ArbitrageOpportunity opportunity;
     Balances holdings, dust;
     Decimal budget = 0;
+    std::int64_t cycle_started_ns = 0, previous_report_ns = 0;
     std::optional<OrderRequest> pending;
     OrderReport accounted;
 
@@ -396,11 +398,25 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     }
     void send(OrderRequest order) {
         order.client_id = cycle + "-" + std::to_string(++order_number);
+        if(config.latency_timestamps) order.latency = {
+            {"cycle_id",cycle},{"leg",leg_number},{"initial_clear",order.initial_clear},
+            {"trigger_receive_sequence",opportunity.trigger_receive_sequence},
+            {"trigger_symbol_index",opportunity.trigger_symbol_index},
+            {"book_receive_sequences",opportunity.receive_sequences},{"book_update_ids",opportunity.book_update_ids},
+            {"book_received_ns",opportunity.received_steady_ns},{"market_received_ns",opportunity.market_received_ns},
+            {"market_received_realtime_ns",opportunity.market_received_realtime_ns},
+            {"market_processed_ns",opportunity.market_processed_ns},{"edge_found_ns",opportunity.edge_found_ns},
+            {"kernel_rx",opportunity.kernel_rx},{"cycle_started_ns",cycle_started_ns},
+            {"previous_report_ns",previous_report_ns},{"order_prepared_ns",steady_time_ns()}};
         pending = std::move(order); accounted = {};
         state = pending->initial_clear ? State::ClearingInitialPosition : State::LegPending;
         publish();
         first_leg_event("arbitrage_first_leg_submit_attempt");
         try {
+            if(config.latency_timestamps) {
+                pending->latency["gateway_submit_ns"]=steady_time_ns();
+                pending->latency["gateway_submit_realtime_ns"]=realtime_ns();
+            }
             gateway.submit(*pending, callback());
             if (pending->initial_clear) ++startup_orders_submitted;
             else if (!cycle_submitted) { cycle_submitted = true; ++submitted_cycles; }
@@ -416,6 +432,12 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     void report(const OrderReport& value) {
         if (!pending || value.client_id != pending->client_id || state == State::Halted) return;
         if (value.revision <= accounted.revision) return;
+        previous_report_ns=steady_time_ns();
+        if(config.latency_timestamps && event_observer) event_observer("execution_order_report", {
+            {"cycle_id",cycle},{"client_id",value.client_id},{"leg",leg_number},
+            {"report_received_ns",previous_report_ns},{"status_code",static_cast<int>(value.status)},
+            {"filled_qty",decimal_text(value.filled_qty)},{"filled_quote",decimal_text(value.filled_quote)},
+            {"failure",value.failure}});
         if (!value.failure.empty()) {
             order_failure = value.failure;
             if (event_observer) event_observer("execution_order_failed", {
@@ -499,6 +521,7 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
             return true;
         });
         if (!known) return false;
+        cycle_started_ns=steady_time_ns(); previous_report_ns=0;
         state = State::Validating; opportunity = candidate; budget = Decimal(candidate.input_usdt);
         failed = false; cycle_submitted = false; reason.clear(); rejection = nlohmann::json::object(); order_failure = nlohmann::json::object(); pending.reset(); holdings.clear();
         leg_number = 0; order_number = 0;

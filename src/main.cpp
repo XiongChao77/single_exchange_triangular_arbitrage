@@ -26,12 +26,16 @@ int main() {
         triangular::OrderBookManager orderbooks(config);
         const auto log_path = kLogDirectory / ("json-" + std::to_string(triangular::wall_time_us()) + ".jsonl");
         triangular::AsyncLogger logger(log_path, {kLogQueueCapacity, kLogBatchThreshold, kLogFlushInterval});
-        logger.log("INFO", "run_started", {{"orderbook_slots", orderbooks.stats().symbols}, {"symbols", config.symbols},
+        logger.log("INFO", "run_started", {{"symbol_count", config.symbols.size()},
+            {"group_count", config.trading_groups.size()}, {"orderbook_slots", orderbooks.stats().symbols}, {"symbols", config.symbols},
             {"triangle_indices", config.triangle_indices}, {"execution_mode", config.execution_mode},
-            {"live_test_mode", config.live_test_mode},
+            {"live_test_mode", config.live_test_mode}, {"max_cycles", config.max_cycles},
+            {"latency_timestamps",config.latency_timestamps},
             {"log_capacity", kLogQueueCapacity},
             {"log_batch_threshold", kLogBatchThreshold}, {"log_flush_interval_ms", kLogFlushInterval.count()}});
-        std::cerr << "INFO log_file=" << log_path.string() << '\n';
+        std::cerr << "INFO log_file=" << log_path.string()
+                  << " symbols=" << config.symbols.size()
+                  << " groups=" << config.trading_groups.size() << '\n';
         boost::asio::io_context io;
         std::unique_ptr<triangular::execution::Gateway> gateway;
         std::unique_ptr<triangular::execution::ArbitrageExecutor> executor;
@@ -39,13 +43,16 @@ int main() {
             auto markets = triangular::execution::load_markets(config, exchange_info);
             triangular::execution::Options options;
             options.execution_timeout = std::chrono::milliseconds(config.execution_timeout_ms);
+            options.max_cycles = config.max_cycles;
             if (config.execution_mode == "paper") {
                 gateway = std::make_unique<triangular::execution::PaperGateway>(io, orderbooks, markets,
                     triangular::execution::Decimal(nlohmann::json(config.commission_taker).dump()),
                     triangular::execution::Balances{{"USDT", triangular::execution::Decimal(config.max_arbitrage_usdt)}});
             } else {
-                gateway = std::make_unique<triangular::execution::BinanceGateway>(io, config, markets);
-                if (config.live_test_mode) options.max_cycles = 2;
+                gateway = std::make_unique<triangular::execution::BinanceGateway>(io, config, markets,
+                    [&](std::string_view event,const nlohmann::json& fields) {
+                        logger.log("INFO",std::string(event),fields);
+                    });
             }
             executor = std::make_unique<triangular::execution::ArbitrageExecutor>(io, config, orderbooks,
                 std::move(markets), *gateway, options, [&](const nlohmann::json& status) {

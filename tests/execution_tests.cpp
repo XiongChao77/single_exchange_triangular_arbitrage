@@ -4,6 +4,7 @@
 #include <deque>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 
 using namespace triangular;
 using namespace triangular::execution;
@@ -73,6 +74,20 @@ struct Fixture {
     void run(){ io.run(); io.restart(); }
 };
 void tests() {
+    {
+        const auto path=std::filesystem::temp_directory_path()/("cycle-limit-"+std::to_string(steady_time_ns())+".json");
+        nlohmann::json config={{"triangles",{{"AB","AUSDT","BUSDT"}}},{"live_test_mode",true}};
+        auto write=[&]{std::ofstream output(path); output << config;};
+        write(); check(load_config(path).max_cycles==2,"Missing limit changed live test default");
+        for(unsigned limit : {0U,1U,7U}) {
+            config["max_cycles"]=limit; write();
+            check(load_config(path).max_cycles==limit,"Configured cycle limit ignored");
+        }
+        for(const nlohmann::json& invalid : {nlohmann::json(-1),nlohmann::json(1.5),nlohmann::json("2"),nlohmann::json(true)}) {
+            config["max_cycles"]=invalid; write(); rejects([&]{load_config(path);});
+        }
+        std::filesystem::remove(path);
+    }
     check(hmac_sha256_hex("NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j",
           "symbol=LTCBTC&side=BUY&type=LIMIT&timeInForce=GTC&quantity=1&price=0.1&recvWindow=5000&timestamp=1499827319559")==
           "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71","HMAC vector failed");
@@ -355,6 +370,28 @@ void tests() {
         e.start_initial_cleanup(); f.run();
         check(states>5 && finished==1 && skipped_bttc==1 && e.stats()["startup_cleanup_results"].contains("BTTC"),
               "Startup details repeated or final summary lost");
+    }
+    {
+        Fixture f; f.config.latency_timestamps=true;
+        f.opportunity.trigger_receive_sequence=123;
+        f.opportunity.receive_sequences={121,122,123};
+        f.opportunity.market_received_ns=steady_time_ns();
+        f.opportunity.market_processed_ns=steady_time_ns();
+        f.opportunity.edge_found_ns=steady_time_ns();
+        std::vector<nlohmann::json> reports;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options(),{},
+            [&](std::string_view name,const nlohmann::json& fields) {
+                if(name=="execution_order_report") reports.push_back(fields);
+            });
+        e.try_start(f.opportunity);f.run();
+        check(f.gateway.requests.size()==3 && reports.size()==3,"All-leg latency reports missing");
+        for(std::size_t i=0;i<3;++i) {
+            const auto& trace=f.gateway.requests[i].latency;
+            check(trace["trigger_receive_sequence"]==123 && trace["book_receive_sequences"]==nlohmann::json({121,122,123}) &&
+                  trace["leg"]==i && trace["gateway_submit_ns"].get<std::int64_t>()>=trace["order_prepared_ns"].get<std::int64_t>(),
+                  "Order lost trigger correlation or latency markers");
+            if(i) check(trace["previous_report_ns"]==reports[i-1]["report_received_ns"],"Next leg lost report correlation");
+        }
     }
     {
         Fixture f; PaperGateway gateway(f.io,f.books,markets(),Decimal(f.config.commission_taker),{{"USDT",1000}});

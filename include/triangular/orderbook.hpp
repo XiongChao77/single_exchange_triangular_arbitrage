@@ -7,7 +7,7 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -36,13 +36,21 @@ struct ArbitrageOpportunity {
     long double output_usdt{};
     long double profit_usdt{};
     long double net_return{};
+    std::array<std::uint64_t,3> receive_sequences{};
+    std::uint64_t trigger_receive_sequence{};
+    std::size_t trigger_symbol_index{};
+    std::int64_t market_received_ns{}, market_received_realtime_ns{}, market_processed_ns{}, edge_found_ns{};
+    nlohmann::json kernel_rx = nlohmann::json::object();
 };
 
 struct Config {
     std::string execution_mode = "disabled"; // disabled, paper, or live.
-    bool live_test_mode = false; // When true, accept at most 10 live arbitrage cycles per process.
-    std::filesystem::path api_key_file;
-    std::filesystem::path secret_key_file;
+    bool live_test_mode = false; // Defaults max_cycles to two when the limit is omitted.
+    bool latency_timestamps = false; // Enable Linux software socket timestamps and latency events.
+    std::filesystem::path tls_keylog_file; // Opt-in capture decryption; empty disables it.
+    std::size_t max_cycles = 0; // Submitted arbitrage cycles per process; zero means unlimited.
+    std::filesystem::path hmac_api_key_file;
+    std::filesystem::path hmac_secret_key_file;
     std::uint64_t execution_timeout_ms = 1000;
     double max_arbitrage_usdt = 100.0; // Maximum initial USDT per triangle execution.
     double commission_taker = 0.0005;

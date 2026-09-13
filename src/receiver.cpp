@@ -1,4 +1,7 @@
 #include "triangular/receiver.hpp"
+#include "triangular/timestamp_stream.hpp"
+#include "triangular/tls_keylog.hpp"
+#include <openssl/sha.h>
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
@@ -32,6 +35,7 @@ using namespace std::chrono_literals;
 nlohmann::json fetch_exchange_info(const Config& config) {
     net::io_context io;
     ssl::context tls(ssl::context::tls_client);
+    enable_tls_keylog(tls.native_handle(), config.tls_keylog_file);
     tls.set_default_verify_paths();
     if (!config.ca_file.empty()) tls.load_verify_file(config.ca_file.string());
     tls.set_verify_mode(ssl::verify_peer);
@@ -101,7 +105,8 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
     struct RawMessage {
         std::array<char, max_message_bytes> payload;
         std::size_t size = 0;
-        std::int64_t received_ns = 0, received_us = 0, published_ns = 0;
+        std::int64_t received_ns = 0, received_us = 0, received_realtime_ns = 0, published_ns = 0;
+        KernelRxWindow kernel_rx;
         std::uint64_t sequence = 0;
         bool text = true;
         std::weak_ptr<Session> source;
@@ -132,6 +137,7 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
         : config(std::move(c)), orderbooks(manager), logger(log), on_opportunity(std::move(handler)),
           retry(io), counts(config.symbols.size()) {
         tls.set_default_verify_paths();
+        enable_tls_keylog(tls.native_handle(), config.tls_keylog_file);
         if (!config.ca_file.empty()) tls.load_verify_file(config.ca_file.string());
         tls.set_verify_mode(ssl::verify_peer);
         if (SSL_CTX_set_min_proto_version(tls.native_handle(), TLS1_2_VERSION) != 1)
@@ -155,7 +161,9 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
 
     void ingest(const nlohmann::json& message, std::size_t wire_bytes, std::int64_t start,
                 std::int64_t received_time, std::int64_t json_parse_ns,
-                std::uint64_t sequence, std::int64_t queue_wait_ns) {
+                std::uint64_t sequence, std::int64_t queue_wait_ns, std::int64_t process_begin,
+                std::int64_t received_realtime_ns, const KernelRxWindow& rx_window) {
+        const auto kernel_rx=config.latency_timestamps ? rx_window.json() : nlohmann::json::object();
         OrderBook orderbook;
         std::size_t index;
         const auto decode_begin = steady_time_ns();
@@ -187,20 +195,34 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
         const bool edge_found = orderbooks.scan_edge(index, opportunity);
         const auto scan_end = steady_time_ns();
         if (edge_found) {
+            opportunity.trigger_receive_sequence = sequence;
+            opportunity.trigger_symbol_index = index;
+            opportunity.market_received_ns = start;
+            opportunity.market_received_realtime_ns = received_realtime_ns;
+            opportunity.market_processed_ns = process_begin;
+            opportunity.edge_found_ns = scan_end;
+            opportunity.kernel_rx = kernel_rx;
             auto legs = nlohmann::json::array();
             for (std::size_t i = 0; i < opportunity.path.size(); ++i) {
                 const auto& leg = opportunity.path[i];
                 legs.push_back({{"symbol", config.symbols.at(leg.index)}, {"buy", leg.buy},
                     {"price", opportunity.prices[i]}, {"qty", opportunity.quantities[i]},
-                    {"book_update_id", opportunity.book_update_ids[i]}});
+                    {"book_update_id", opportunity.book_update_ids[i]}, {"receive_sequence", opportunity.receive_sequences[i]}});
             }
             logger.log("INFO", "arbitrage_edge", {{"updated_index", index},
-                {"group_index", opportunity.group_index}, {"input_usdt", opportunity.input_usdt},
+                {"trigger_receive_sequence", sequence}, {"group_index", opportunity.group_index}, {"input_usdt", opportunity.input_usdt},
                 {"output_usdt", opportunity.output_usdt}, {"profit_usdt", opportunity.profit_usdt},
                 {"net_return", opportunity.net_return}, {"legs", std::move(legs)}});
             if (on_opportunity) on_opportunity(opportunity);
         }
         const auto processing_end = steady_time_ns();
+        if(config.latency_timestamps) logger.log("INFO","market_latency", {
+            {"receive_sequence",sequence},{"symbol",config.symbols[index]},
+            {"market_received_ns",start},{"market_received_realtime_ns",received_realtime_ns},
+            {"market_processed_ns",process_begin},{"depth_decode_begin_ns",decode_begin},
+            {"depth_decode_end_ns",decode_end},{"book_update_begin_ns",update_begin},
+            {"book_update_end_ns",update_end},{"scan_begin_ns",scan_begin},{"edge_found_ns",scan_end},
+            {"processing_end_ns",processing_end},{"kernel_rx",kernel_rx}});
         // update() moves the symbol string; scalar fields remain available for logging.
         if (!logger.log("INFO", "receiver_orderbook", {
                 {"receive_sequence", orderbook.receive_sequence}, {"symbol", config.symbols[index]},
@@ -227,7 +249,7 @@ struct Receiver::Impl : std::enable_shared_from_this<Receiver::Impl> {
 struct Receiver::Impl::Session : std::enable_shared_from_this<Session> {
     std::weak_ptr<Impl> owner;
     tcp::resolver resolver;
-    websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws;
+    websocket::stream<beast::ssl_stream<TimestampStream>> ws;
     net::steady_timer deadline;
     beast::flat_buffer buffer{1024 * 1024};
     websocket::response_type response;
@@ -273,6 +295,8 @@ struct Receiver::Impl::Session : std::enable_shared_from_this<Session> {
                 [self](Error error, const tcp::resolver::results_type::endpoint_type&) {
                     if (self->ended) return;
                     if (error) return self->fail("tcp", error);
+                    if(auto receiver=self->owner.lock(); receiver && receiver->config.latency_timestamps)
+                        self->ws.next_layer().next_layer().enable(true,false);
                     self->ws.next_layer().async_handshake(ssl::stream_base::client, [self](Error tls_error) {
                         if (self->ended) return;
                         if (tls_error) return self->fail("tls", tls_error);
@@ -297,17 +321,21 @@ struct Receiver::Impl::Session : std::enable_shared_from_this<Session> {
             self->deadline.cancel();
             if (auto receiver = self->owner.lock())
                 receiver->logger.log("INFO", "connected", {{"host", self->host}, {"streams", self->target}});
+            if(auto receiver=self->owner.lock(); receiver && receiver->config.latency_timestamps)
+                receiver->logger.log("INFO","kernel_timestamp_capability",self->ws.next_layer().next_layer().capability());
             self->read();
         });
     }
     void read() {
-        ws.async_read(buffer, [self = shared_from_this()](Error ec, std::size_t) {
+        const auto rx_before=ws.next_layer().next_layer().rx_reads();
+        ws.async_read(buffer, [self = shared_from_this(),rx_before](Error ec, std::size_t) {
             if (self->ended) return;
             if (ec) return self->fail("read", ec);
             const auto impl = self->owner.lock();
             if (!impl || impl->stopped) return self->cancel();
             const auto start = steady_time_ns();
             const auto received_time = wall_time_us();
+            const auto received_realtime=impl->config.latency_timestamps ? realtime_ns() : 0;
             const auto bytes = self->buffer.data();
             const auto sequence = impl->wire_received.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto write = impl->write_index.load(std::memory_order_relaxed);
@@ -322,6 +350,8 @@ struct Receiver::Impl::Session : std::enable_shared_from_this<Session> {
                 slot.size = bytes.size();
                 slot.received_ns = start;
                 slot.received_us = received_time;
+                slot.received_realtime_ns = received_realtime;
+                if(impl->config.latency_timestamps) slot.kernel_rx=self->ws.next_layer().next_layer().rx_window(rx_before);
                 slot.sequence = sequence;
                 slot.text = self->ws.got_text();
                 slot.source = self;
@@ -357,6 +387,18 @@ void Receiver::Impl::process(std::size_t max_batch) {
             ? nlohmann::json::parse(slot.payload.data(), slot.payload.data() + slot.size, nullptr, false)
             : nlohmann::json();
         const auto parse_ns = steady_time_ns() - parse_begin;
+        if (!config.tls_keylog_file.empty()) {
+            unsigned char digest[SHA256_DIGEST_LENGTH];
+            SHA256(reinterpret_cast<const unsigned char*>(slot.payload.data()), slot.size, digest);
+            static constexpr char hex[] = "0123456789abcdef";
+            std::string fingerprint(SHA256_DIGEST_LENGTH * 2, '0');
+            for (std::size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+                fingerprint[i * 2] = hex[digest[i] >> 4];
+                fingerprint[i * 2 + 1] = hex[digest[i] & 15];
+            }
+            logger.log("INFO", "capture_market_identity", {{"receive_sequence", slot.sequence},
+                {"payload_sha256", fingerprint}, {"payload_bytes", slot.size}});
+        }
         const auto& control = message.is_object() && message.contains("data") ? message["data"] : message;
         const bool shutdown = control.is_object() && control.contains("e") && control["e"] == "serverShutdown";
         const bool error = message.is_object() && message.contains("code");
@@ -366,7 +408,8 @@ void Receiver::Impl::process(std::size_t max_batch) {
                     connection->fail(shutdown ? "serverShutdown" : "stream_control_error", net::error::connection_reset);
             });
         } else if (!(message.is_object() && message.contains("result") && message["result"].is_null() && message.contains("id"))) {
-            ingest(message, slot.size, slot.received_ns, slot.received_us, parse_ns, slot.sequence, wait_ns);
+            ingest(message, slot.size, slot.received_ns, slot.received_us, parse_ns, slot.sequence, wait_ns,
+                parse_begin,slot.received_realtime_ns,slot.kernel_rx);
         }
         slot.source.reset();
         read_index.store(read + 1, std::memory_order_release);

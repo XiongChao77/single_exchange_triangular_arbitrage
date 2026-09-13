@@ -55,9 +55,10 @@ def main():
         context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.load_cert_chain(cert,key)
         listener=socket.socket(); listener.bind(("127.0.0.1",0)); listener.listen(); listener.settimeout(15)
         port=str(listener.getsockname()[1])
-        config={"execution_mode":"paper","host":"localhost","port":port,"rest_host":"localhost","rest_port":port,
+        config={"execution_mode":"paper","max_cycles":7,"latency_timestamps":True,"host":"localhost","port":port,"rest_host":"localhost","rest_port":port,
                 "ca_file":"../cert.pem",
                 "triangles":[["ETHBTC","ETHUSDT","BTCUSDT"],["BTCUSDT","BNBBTC","BNBUSDT"]]}
+        config['tls_keylog_file'] = '../tls.keys'
         (root/"configs").mkdir(); (root/"configs/binance.json").write_text(json.dumps(config))
         errors=[]; complete=threading.Event()
 
@@ -99,6 +100,7 @@ def main():
             events=lambda name:[row["fields"] for row in rows if row["event"]==name]
             assert not any(row["event"].startswith("startup_cleanup_") for row in rows), "Startup cleanup ran"
             execution=events("execution_final")[0]
+            assert execution["max_cycles"]==7,execution
             assert execution["startup_cleanup_started"] is False and execution["startup_orders_submitted"]==0,execution
             final=events("pipeline_final")[0]
             count=final["orderbook_store"]["received"]
@@ -111,6 +113,13 @@ def main():
                 assert all(row[field]>=0 for field in timing_fields),row
                 assert row["processing_before_log_ns"]>=sum(row[field] for field in timing_fields),row
                 assert isinstance(row["edge_found"],bool)
+            capability=events("kernel_timestamp_capability")[0]
+            assert capability["rx_enabled"] is True and capability["setsockopt_errno"]==0,capability
+            latency=events("market_latency")
+            assert len(latency)==count, (len(latency),count)
+            assert any(batch["kernel_rx_realtime_ns"] for row in latency for batch in row["kernel_rx"]["batches"]),"No RX software timestamps"
+            assert all(row["kernel_rx"]["exact_message_mapping"] is False for row in latency)
+            assert all(row["market_received_ns"]<=row["market_processed_ns"]<=row["edge_found_ns"] for row in latency)
             receiver_stats=final["receiver"]
             assert receiver_stats["wire_received"]==2206,receiver_stats
             assert receiver_stats["oversized_total"]==0,receiver_stats
@@ -118,6 +127,11 @@ def main():
             assert receiver_stats["queue_depth"]==0,receiver_stats
             assert 1<=receiver_stats["queue_high_watermark"]<=receiver_stats["queue_capacity"],receiver_stats
             sequences=[row["receive_sequence"] for row in received]
+            identities=events('capture_market_identity')
+            assert len(identities)>=len(received)
+            assert all(len(row['payload_sha256'])==64 for row in identities)
+            assert (root/'tls.keys').stat().st_mode & 0o777 == 0o600
+            assert 'TRAFFIC_SECRET' in (root/'tls.keys').read_text() or 'CLIENT_RANDOM' in (root/'tls.keys').read_text()
             assert sequences==sorted(set(sequences)),sequences
             assert all(row["receive_to_decision_ns"]>=row["queue_wait_ns"]+row["json_parse_ns"]+row["scan_edge_ns"] for row in received)
             latest=events("latest_orderbook"); assert len(latest)==5

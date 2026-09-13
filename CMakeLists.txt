@@ -39,6 +39,10 @@ if(BUILD_TESTING)
   add_test(NAME logging COMMAND logging_tests)
   set_tests_properties(logging PROPERTIES TIMEOUT 20)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME capture_match COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/capture_match_tests.py)
+  add_test(NAME latency_summary COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/latency_summary_tests.py)
   add_executable(gateway_failure_probe tests/gateway_failure_probe.cpp)
   target_link_libraries(gateway_failure_probe PRIVATE market_execution)
   add_test(NAME gateway_failure_integration COMMAND ${Python3_EXECUTABLE}

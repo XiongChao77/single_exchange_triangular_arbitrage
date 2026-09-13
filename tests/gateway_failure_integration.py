@@ -98,6 +98,87 @@ def run_case(binary, root, context, case, http_status, code, expected_status, st
     print(case + ": passed")
 
 
+def run_reuse_case(binary, root, context, mode):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0)); listener.listen(); listener.settimeout(5)
+    port = str(listener.getsockname()[1])
+    errors, client_ids = [], []
+    connections = 0
+
+    def respond(sock, body, close=False):
+        payload = json.dumps(body).encode()
+        connection = "close" if close else "keep-alive"
+        sock.sendall(f"HTTP/1.1 200 Test\r\nContent-Length: {len(payload)}\r\nConnection: {connection}\r\n\r\n".encode()+payload)
+
+    def serve():
+        nonlocal connections
+        try:
+            account_done, orders = False, 0
+            while orders < 3:
+                raw,_ = listener.accept(); connections += 1
+                with context.wrap_socket(raw,server_side=True) as sock:
+                    sock.settimeout(5)
+                    while orders < 3:
+                        target = read_request(sock)
+                        if not account_done:
+                            assert urlsplit(target).path == "/api/v3/account"
+                            respond(sock,{"balances":[{"asset":"USDT","free":"100"}]})
+                            account_done = True
+                            continue
+                        assert urlsplit(target).path == "/api/v3/order"
+                        client_ids.append(parse_qs(urlsplit(target).query)["newClientOrderId"][0])
+                        orders += 1
+                        if mode == "read_failure" and orders == 1:
+                            break
+                        close = mode == "server_close" and orders == 1
+                        if mode == "filled":
+                            respond(sock,{"status":"FILLED","executedQty":"20","cummulativeQuoteQty":"970.8",
+                                "orderId":orders,"fills":[{"qty":"20","commission":"0.001","commissionAsset":"TRY"}]})
+                        else:
+                            respond(sock,{"code":-1013,"msg":"Synthetic rejection"},close)
+                        if close: break
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            listener.close()
+
+    thread=threading.Thread(target=serve,daemon=True); thread.start()
+    result=subprocess.run([binary,port,str(root/"cert.pem"),str(root/"api"),str(root/"secret"),"3"],
+                          capture_output=True,text=True,timeout=10)
+    thread.join(timeout=5)
+    assert not thread.is_alive() and not errors,(mode,errors)
+    assert result.returncode==0,(mode,result.stderr)
+    reports=json.loads(result.stdout)
+    assert client_ids==["probe-first-leg-0","probe-first-leg-1","probe-first-leg-2"],(mode,client_ids)
+    assert connections==(1 if mode in ("keep_alive","filled") else 2),(mode,connections)
+    assert len(reports)==3
+    for index,report in enumerate(reports):
+        expected="UNKNOWN" if mode=="read_failure" and index==0 else "FILLED" if mode=="filled" else "REJECTED"
+        assert report["status"]==expected,(mode,report)
+        detail=report["latency"]["transport"]
+        reused=mode in ("keep_alive","filled") or index!=1
+        assert detail["connection_reused"]==reused,(mode,index,detail)
+        assert len(report["write_events"])==index+1,(mode,index,report)
+        assert report["write_events"][-1]["client_id"]==client_ids[index]
+        latency=report["latency"]
+        assert latency["gateway_enqueued_ns"]<=latency["worker_begin_ns"]<=latency["sign_begin_ns"]<=latency["sign_end_ns"]
+        assert latency["report_ready_ns"]<=latency["callback_received_ns"]
+        if not (mode=="read_failure" and index==0):
+            tx=detail["kernel_tx"]
+            assert tx["enabled"] and tx["final_byte_timestamp_present"],(mode,index,tx)
+            assert tx["kernel_tx_sched_realtime_ns"]<=tx["kernel_tx_software_realtime_ns"],tx
+            assert tx["ciphertext_end"]>tx["ciphertext_begin"],tx
+            points=detail["timepoints"]
+            assert points["http_write_begin_ns"]<=points["http_write_end_ns"]<=points["http_response_ns"]
+        if mode=="read_failure" and index==0:
+            assert detail["stage"]=="http_read" and detail["outcome_uncertain"] is True
+        if reused:
+            assert "tls_handshake" not in detail["timing_us"],detail
+        else:
+            assert "tls_handshake" in detail["timing_us"],detail
+    print("connection_"+mode+": passed")
+
+
 def main():
     binary = str(Path(sys.argv[1]).resolve())
     with tempfile.TemporaryDirectory(prefix="gateway-failure-") as folder:
@@ -123,6 +204,8 @@ def main():
             ("read_failure", None, None, "UNKNOWN", "http_read"),
         ]:
             run_case(binary, root, context, *case)
+        for mode in ("keep_alive", "server_close", "read_failure", "filled"):
+            run_reuse_case(binary, root, context, mode)
 
 
 if __name__ == "__main__":

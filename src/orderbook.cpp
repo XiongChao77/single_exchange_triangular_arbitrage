@@ -75,11 +75,24 @@ Config load_config(const std::filesystem::path& path) {
     c.execution_mode = j.value("execution_mode", c.execution_mode);
     if (c.execution_mode != "disabled" && c.execution_mode != "paper" && c.execution_mode != "live")
         throw std::runtime_error("execution_mode must be disabled, paper, or live");
+    c.latency_timestamps = j.value("latency_timestamps", false);
+    if (j.contains("tls_keylog_file") && !j.at("tls_keylog_file").get<std::string>().empty())
+        c.tls_keylog_file = resolve(path, j.at("tls_keylog_file").get<std::string>());
     c.live_test_mode = j.value("live_test_mode", c.live_test_mode);
-    if (j.contains("api_key_file")) c.api_key_file = resolve(path, j.at("api_key_file").get<std::string>());
-    if (j.contains("secret_key_file")) c.secret_key_file = resolve(path, j.at("secret_key_file").get<std::string>());
-    if (c.execution_mode == "live" && (c.api_key_file.empty() || c.secret_key_file.empty()))
-        throw std::runtime_error("live execution requires api_key_file and secret_key_file");
+    c.max_cycles = c.live_test_mode ? 2 : 0;
+    if (j.contains("max_cycles")) {
+        const auto& limit = j.at("max_cycles");
+        if (!limit.is_number_integer() || (limit.is_number_integer() && !limit.is_number_unsigned() && limit.get<std::int64_t>() < 0))
+            throw std::runtime_error("max_cycles must be a non-negative integer");
+        const auto value = limit.get<std::uint64_t>();
+        if (value > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("max_cycles exceeds supported range");
+        c.max_cycles = static_cast<std::size_t>(value);
+    }
+    if (j.contains("hmac_api_key_file")) c.hmac_api_key_file = resolve(path, j.at("hmac_api_key_file").get<std::string>());
+    if (j.contains("hmac_secret_key_file")) c.hmac_secret_key_file = resolve(path, j.at("hmac_secret_key_file").get<std::string>());
+    if (c.execution_mode == "live" && (c.hmac_api_key_file.empty() || c.hmac_secret_key_file.empty()))
+        throw std::runtime_error("live execution requires hmac_api_key_file and hmac_secret_key_file");
     c.execution_timeout_ms = j.value("execution_timeout_ms", c.execution_timeout_ms);
     if (c.execution_timeout_ms == 0 || c.execution_timeout_ms > 60000)
         throw std::runtime_error("execution_timeout_ms must be in [1, 60000]");
@@ -131,7 +144,7 @@ Config load_config(const std::filesystem::path& path) {
 std::vector<TradeGroup> validate_arbitrage(const Config& config, const nlohmann::json& exchange_info) {
     std::unordered_map<std::string, std::pair<std::string, std::string>> markets;
     for (const auto& market : exchange_info.at("symbols")) {
-        printf("symbol:%s,status:%s,baseAsset:%s,quoteAsset:%s \n",market.at("symbol").get_ref<const std::string&>().c_str(),market.at("status").get_ref<const std::string&>().c_str(),market.at("baseAsset").get_ref<const std::string&>().c_str(),market.at("quoteAsset").get_ref<const std::string&>().c_str());
+        // printf("symbol:%s,status:%s,baseAsset:%s,quoteAsset:%s \n",market.at("symbol").get_ref<const std::string&>().c_str(),market.at("status").get_ref<const std::string&>().c_str(),market.at("baseAsset").get_ref<const std::string&>().c_str(),market.at("quoteAsset").get_ref<const std::string&>().c_str());
         const auto symbol = market.at("symbol").get<std::string>();
         if (!config.symbol_indices.contains(symbol)) continue;
         if (market.at("status") != "TRADING" || !market.at("isSpotTradingAllowed").get<bool>())
@@ -308,6 +321,7 @@ bool OrderBookManager::scan_edge(std::size_t index, ArbitrageOpportunity& result
                 candidate.prices[i] = rate;
                 candidate.quantities[i] = base_qty;
                 candidate.book_update_ids[i] = slot->book_update_id;
+                candidate.receive_sequences[i] = slot->receive_sequence;
                 candidate.received_steady_ns[i] = slot->received_steady_ns;
                 // Model commission as deducted from the asset received on each leg.
                 output = (leg.buy ? base_qty : base_qty * rate) * fee_multiplier_;

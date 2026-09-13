@@ -53,6 +53,18 @@ until Ctrl+C or SIGTERM. There are no command-line options. Start with:
 ./build/json_receiver
 ```
 
+# latency analysis
+sudo ethtool -K <iface> gro off lro off
+sudo tcpdump -i <iface> -nn -s 0 -B 32768 -U \
+  -w local.pcap 'tcp and (port 443 or port 9443)'
+
+python3 tools/analyze_capture_latency.py \
+  --local-pcap /home/chao/work/single_exchange_triangular_arbitrage/local.pcap \
+  --pcap /home/chao/work/single_exchange_triangular_arbitrage/logs/1789332734363617.pcapng \
+  --log /home/chao/work/single_exchange_triangular_arbitrage/logs/json-1789332734363617.jsonl \
+  --keys /home/chao/work/single_exchange_triangular_arbitrage/logs/capture-session.keys \
+  --output /home/chao/work/single_exchange_triangular_arbitrage/logs/latency-analysis-1789332734363617.json
+
 The default endpoint is `wss://stream.binance.com:9443`; set `port` to `"443"`
 in `configs/binance.json` to use `wss://stream.binance.com:443`.
 Public market streams require no API key. The client subscribes through
@@ -122,32 +134,28 @@ populated slot, including its index.
 
 Metadata reference: [Binance exchangeInfo](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#exchange-information).
 
-套利扫描：启动时读取 `configs/binance.json`（当前目录不存在该文件时，读取
-`/root/work/single_exchange_triangular_arbitrage/configs/binance.json`），并通过
-`exchangeInfo` 的 base/quote 信息为每组三角组合生成正反两条闭环路径。
-假设初始仅持有 USDT，每组必须包含两个以 USDT 为 quote 的交易对；
-分别通过这两个交易对买入作为第一腿，最终卖出回到 USDT。
-例如 ETH/BTC/USDT 的路径为 `USDT → ETH → BTC → USDT` 和
-`USDT → BTC → ETH → USDT`，与配置中交易对的排列顺序无关。
-`validate_arbitrage` 返回 `TradeGroup` 列表，存入 `Config::trading_groups` 后创建订单簿管理器。
-每个 group 保存三个交易对的索引和两条 path，每条 path 包含三条交易腿。
-每次行情更新调用 `scan_edge(index, opportunity)`，遍历 groups，检查包含该交易对的组内两条路径。
-同一交易对可能属于多个 group；找到任意超过阈值的路径即可返回 true。
-买入按 ask 换算，卖出按 bid 换算，每条腿的所得乘以
-`1 - commission_taker`；最终净收益率严格大于 `edge_threshold` 才成立，
-并记录 `arbitrage_edge` 日志。两个配置值均为比例，例如 `0.0001` 为 0.01%。
-缺失报价或所用一档价格、数量非正时跳过该路径。这是顶层报价收益率扫描，
-`max_arbitrage_usdt` 默认为 100，限制单次三角套利的初始 USDT 投入。
-扫描根据三条腿的最优档数量进一步缩小投入，手续费按每腿收到的资产扣除。
-返回 `ArbitrageOpportunity`，其中 `path` 是三条交易腿，`prices` 为 quote/base 价格，
-`quantities` 为每腿下单的 base 数量（买卖均相同、扣手续费前），并附上
-订单簿更新 ID、接收时间、预计投入/回款/利润和净收益率。无机会时清空输出参数。
-当前返回配置顺序中第一个合格机会，不保证利润最大。
-扫描仅按三腿 bid/ask 换算和配置手续费计算理论收益率，严格大于 `edge_threshold` 才返回机会；
-扫描不进行 tick/step 取整、账户余额或 dust 回款模拟。预计数量和收益均为未取整的理论值。
-下单阶段不再重复检查收益阈值。独立执行模块在一轮开始前验证报价与市场限制、按十进制
-交易所 tick/step 取整，并按真实网关回报
-推进订单。可选择本地模拟网关或 Binance Spot live REST 网关。实现说明见
+Arbitrage scanning loads `configs/binance.json` at startup, falling back to
+`/root/work/single_exchange_triangular_arbitrage/configs/binance.json` when needed. It uses
+exchangeInfo base/quote data to generate both closed paths for each triangle.
+The initial balance is assumed to be USDT. Each group must contain two markets quoted in USDT,
+which buy the first leg and eventually sell back to USDT. For ETH/BTC/USDT the paths are
+`USDT -> ETH -> BTC -> USDT` and `USDT -> BTC -> ETH -> USDT`, regardless of configuration order.
+`validate_arbitrage` returns `TradeGroup` objects stored in `Config::trading_groups` before creating the order book manager.
+Each group stores three market indices and two paths of three legs. Each market update calls
+`scan_edge(index, opportunity)`, which checks both paths in every group containing that market.
+A market may belong to several groups; any path above the threshold returns true.
+Buys use ask prices and sells use bids. Each leg applies `1 - commission_taker`; the net return must
+strictly exceed `edge_threshold`, and the `arbitrage_edge` event is recorded. Both values are ratios;
+for example, `0.0001` means 0.01%.
+Missing quotes or non-positive top-level prices and quantities skip a path. The top-level scan limits
+the initial USDT input with `max_arbitrage_usdt`, which defaults to 100. Best-level quantities reduce
+the input further and fees are deducted from the asset received on each leg.
+The returned `ArbitrageOpportunity` contains the path, quote/base prices, base quantities before fees,
+book update IDs, receive times, estimated input/output/profit, and net return. No opportunity clears
+the output parameters. The first qualifying path in configuration order is returned; maximum profit is not guaranteed.
+The scan computes theoretical return from three bid/ask levels and configured fees. It does not round
+tick/step sizes or simulate balances and dust; the execution module performs those checks before orders.
+The independent execution module is described in
 [execution_plan.md](execution_plan.md)。
 
 Order book log serialization lives in `orderbook_logging.hpp/.cpp`. Events use
@@ -185,10 +193,16 @@ It submits normal legs as LIMIT/FOK and initial-balance clearing orders as LIMIT
 `/api/v3/account` response seeds a local balance cache; FULL order responses update the cache
 from cumulative fills and commissions, avoiding account REST calls between legs. Query and cancel
 remain gateway operations, but the current low-latency executor does not invoke them.
+The gateway reuses its verified TLS connection with HTTP keep-alive, including the connection
+opened for the initial account snapshot. Requests execute sequentially on the REST worker.
+A server `Connection: close` response or transport error discards the connection; the next
+request reconnects. An order POST is never automatically replayed after a write/read failure.
+Transport diagnostics include `connection_reused`, `connection_id` and establishment timings.
 
-Live mode requires `api_key_file` and `secret_key_file`; credential contents are never logged.
-With `live_test_mode: true`, the current executable permits at most two cycles that submit
-an order to the gateway. `max_cycles` uses `submitted_cycles`, incremented once when the first
+Live mode requires `hmac_api_key_file` and `hmac_secret_key_file`; credential contents are never logged.
+The `max_cycles` configuration limits submitted arbitrage cycles in both live and paper mode;
+`0` means unlimited. The checked-in configuration uses `2`. When omitted, the limit defaults
+to two with `live_test_mode: true`, otherwise unlimited. `max_cycles` uses `submitted_cycles`, incremented once when the first
 arbitrage `Gateway::submit` returns successfully. Startup IOC clearing orders are counted
 separately in `startup_orders_submitted` and do not consume `max_cycles`. Balance and
 preflight failures before submission do not consume the allowance. Submitted orders that are
@@ -246,11 +260,50 @@ Example live-only fields:
 {
   "execution_mode": "live",
   "live_test_mode": true,
-  "api_key_file": "secrets/binance_api_key",
-  "secret_key_file": "secrets/binance_secret_key"
+  "max_cycles": 2,
+  "hmac_api_key_file": "secrets/binance_api_key",
+  "hmac_secret_key_file": "secrets/binance_secret_key"
 }
 ```
 
 The current live adapter intentionally serializes private REST requests. It does not yet maintain a Binance user-data WebSocket, implement automatic
 clock offset correction, rate-limit scheduling, or automatic cross-process recovery. These limits
 make `live_test_mode` suitable for bounded integration testing, not unattended production trading.
+
+Linux local latency measurement is enabled with `"latency_timestamps": true` (set false for a
+measurement-overhead baseline). It needs no privileges for socket software timestamps and makes
+no extra exchange REST requests. `kernel_timestamp_capability` records socket setup success;
+missing timestamps stay null. The executable continues to perform no startup balance cleanup.
+
+`market_latency` records userspace message receipt, processing, decoding, book update and scanning
+markers. `execution_order_write` records request write completion without waiting for the HTTP
+response. `execution_order_latency` records all order legs, including failures and late reports,
+with gateway queue, signing, connect, TLS write, response and callback markers. These events share
+`client_id` and carry the cycle/leg, triggering `receive_sequence`, all three book receive sequences
+and book update IDs. Subsequent legs also carry the previous report-received time.
+
+The transport adapter reads RX ancillary data below TLS via `recvmsg`. RX observations describe
+TCP reads performed during a WebSocket read, **not exact per-message kernel receipt**. TCP/TLS and
+WebSocket buffering can split or combine messages or read ahead; `exact_message_mapping` is
+always false. A callback with no new TCP read gets no fabricated RX timestamp. Exact message
+correlation still needs a TCP/TLS-record/WebSocket byte-range mapping implementation; alternatively
+use packet/eBPF tracing with socket identity and TCP sequence ranges to validate transport timing.
+A recvmsg can itself combine packets, so its ancillary timestamp is not a complete packet history.
+
+TX uses `TX_SCHED`, `TX_SOFTWARE`, `OPT_ID`, `OPT_ID_TCP` and `OPT_TSONLY`. The adapter counts
+ciphertext bytes below TLS, drains `MSG_ERRQUEUE`, filters the request byte range and reports a
+final-byte timestamp only when the matching TCP ID arrives. IDs are scoped to `connection_id`;
+TLS handshakes and earlier requests are excluded. These times represent the scheduler and driver
+software boundaries, not physical NIC transmission. Missing final IDs, truncated controls and drain
+limits are reported. Data-path read/write timestamping is optional; no traffic is replayed for it.
+
+Application `*_ns` markers use the monotonic clock. Kernel software times and explicit
+`*_realtime_ns` markers use CLOCK_REALTIME. The summarizer checks real/monotonic offset consistency
+(with a 1 ms tolerance) before cross-boundary comparisons; this is a clock-jump filter, not a precision
+clock calibration. It never subtracts a realtime stamp directly from a monotonic stamp. RX-batch
+spans are reported as observations, never as exact per-message end-to-end latency. NIC buffering and
+RX processing before the kernel timestamp remain unmeasurable from these software stamps.
+
+Run `python3 tools/summarize_latency.py logs/<run>.jsonl --append-report latency_report.md` to
+summarize p50/p95/p99/max and coverage and append a run to the common report. Compare enabled and
+disabled runs under the same load to quantify added recvmsg, timestamp and logging overhead.

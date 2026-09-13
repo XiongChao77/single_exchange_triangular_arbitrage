@@ -36,6 +36,7 @@ struct OrderRequest {
     bool buy{};
     std::string price, quantity;
     bool initial_clear{}; // Normal orders use LIMIT FOK; startup position clearing uses LIMIT IOC.
+    nlohmann::json latency = nlohmann::json::object();
 };
 struct OrderReport {
     std::string client_id;
@@ -44,6 +45,7 @@ struct OrderReport {
     Decimal filled_qty = 0, filled_quote = 0;
     Balances commissions; // CUMULATIVE per asset, not the last fill's commission.
     bool accounting_complete = true; // Terminal state may precede retrieval of all trades/fees.
+    nlohmann::json latency = nlohmann::json::object();
     nlohmann::json failure = nlohmann::json::object(); // Sanitized gateway failure diagnostics.
 };
 
@@ -104,7 +106,8 @@ private:
 // callbacks are posted back to the supplied io_context thread.
 class BinanceGateway final : public Gateway {
 public:
-    BinanceGateway(boost::asio::io_context&, const Config&, std::vector<Market>);
+    BinanceGateway(boost::asio::io_context&, const Config&, std::vector<Market>,
+                   ArbitrageExecutor::EventObserver = {});
     ~BinanceGateway() override;
     Balances balances() const override;
     void submit(const OrderRequest&, Callback) override;

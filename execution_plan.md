@@ -1,50 +1,48 @@
-# 三角套利 execution 模块
+# Triangular Arbitrage Execution Module
 
-`OrderBookManager` 按 group 扫描两条以 USDT 开始和结束的 path，`Receiver` 把机会交给全局唯一的
-`ArbitrageExecutor`。执行器工作期间直接拒绝其他 group 的机会，因此配置可以共享 `BTCUSDT` 等
-symbol，同时只会执行一组三角套利。
+`OrderBookManager` scans two USDT round-trip paths for each group. `Receiver` passes opportunities to the single
+global `ArbitrageExecutor`. While it is active, other groups are rejected, so groups may share symbols such as
+`BTCUSDT` while only one triangle executes at a time.
 
-## 执行流程
+## Execution Flow
 
-一轮被接受后，执行器只做一次开始前检查：
+After a cycle is accepted, the executor performs these preflight checks once:
 
-1. 从 Gateway 的余额缓存确认 USDT 足够。
-2. 检查该 group 涉及的非 USDT asset。若存在余额，先通过 group 内对应的 `asset/USDT`
-   最优 bid 发送 LIMIT/IOC 卖单；低于交易过滤器的余额记为 dust。
-3. 一次性读取三本 order book，检查时效、一档流动性、扫描价格没有变差、交易过滤器以及取整后利润。
-4. 顺序发送三条 LIMIT/FOK 主动单。
+1. Confirm sufficient USDT in the Gateway balance cache.
+2. Sell existing non-USDT balances with a LIMIT/IOC order on the matching `asset/USDT` market; balances below
+   exchange filters are recorded as dust.
+3. Read all three order books once and validate age, top-level liquidity, prices, exchange filters, and profit
+   after rounding.
+4. Send three LIMIT/FOK orders in sequence.
 
-第一条腿发出后不再读取 order book、不重新计算 edge，也不查询账户余额。后续订单价格使用
-`ArbitrageOpportunity::prices` 中已接受的价格，数量则根据上一条订单实际成交数量和实际手续费计算。
-这样保留成交驱动的数量控制，同时去掉腿间行情和账户检查造成的延迟。
+After the first leg is sent, the executor does not reread books, recalculate the edge, or query balances. Later
+prices use accepted `ArbitrageOpportunity::prices`; quantities use the previous fill and actual fee.
 
-## 状态和失败
+## State and Failure
 
-状态主路径为：
+The main state path is `IDLE -> VALIDATING -> LEG_PENDING (legs 1/2/3) -> IDLE`, with initial position clearing
+before the legs when required. Only one cycle may execute at a time. A rejected, expired, canceled, or incomplete
+leg fails the cycle and returns to `IDLE` without an emergency cleanup order. An Unknown result or a cycle
+exceeding `execution_timeout_ms` enters `HALTED`; the current version does not query, cancel, recover, or log intent.
 
-    IDLE → VALIDATING → LEG_PENDING（第 1/2/3 腿）→ IDLE
-                  ↘ CLEARING_INITIAL_POSITION ↗
-
-同一时刻只允许一轮执行。某条腿被拒绝、过期、取消或没有完全成交时，本轮记为失败并返回
-`IDLE`，不会发送异常清仓订单。订单结果为 Unknown 或整轮超过 `execution_timeout_ms` 时进入
-`HALTED`，阻止新执行；当前版本不查单、不撤单、不恢复，也不记录订单意图。
-
-`execution_timeout_ms` 配置的是从接受机会开始，到已有资产清理和三条套利腿全部完成的总时间。
-当前配置为 1000ms，加载时允许范围为 1 到 60000ms。
+`execution_timeout_ms` covers accepting an opportunity through cleanup and all three legs. The current value is
+1000 ms; valid values are 1 to 60000 ms.
 
 ## Gateway
 
-`PaperGateway` 使用最优档模拟成交和钱包。`BinanceGateway` 在独立 worker 线程执行签名 HTTPS，
-再把回调投递到主 `io_context`。构造 live gateway 时调用一次 `/api/v3/account` 建立余额缓存；
-每个 `newOrderRespType=FULL` 回报的累计成交与手续费直接更新缓存，因此三条腿之间没有额外账户请求。
+`PaperGateway` simulates fills and balances at the best level. `BinanceGateway` signs HTTPS in a worker thread
+and posts callbacks to the main `io_context`. A live gateway calls `/api/v3/account` once to build its balance
+cache; cumulative fills and fees from each `newOrderRespType=FULL` response update the cache, so no extra
+account request is made between legs.
 
-普通套利订单使用 LIMIT/FOK，开始前清理已有资产使用 LIMIT/IOC。Gateway 接口仍保留 query/cancel，
-方便以后扩展，但当前低延迟执行路径不调用它们。
+Normal arbitrage orders use LIMIT/FOK; preflight cleanup uses LIMIT/IOC. The Gateway interface retains
+query/cancel for future extensions, but the low-latency path does not call them.
 
-`live_test_mode=true` 时每个进程最多接受 10 轮套利。失败和开始前检查失败也计入额度。配置中的
-密钥文件只在 live 模式读取，内容不会写入日志。
+`live_test_mode=true` accepts at most 10 cycles per process. Failed cycles and failed preflight checks count
+against the limit. Key files are read only in live mode and are never written to logs.
 
-## 当前范围
+## Current Scope
 
-当前实现面向正常成交路径，没有订单意图日志、跨进程恢复、用户数据 WebSocket、异常仓位自动清理、
-时钟偏移校准或完整限流调度。默认配置仍为 paper 模式，不会发送真实订单。
+The implementation targets the normal fill path. It has no order-intent log, cross-process recovery, user-data
+WebSocket, automatic abnormal-position cleanup, clock-offset calibration, or full rate-limit scheduler. The
+default configuration remains paper mode and sends no real orders.
