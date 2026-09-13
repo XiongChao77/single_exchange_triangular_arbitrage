@@ -1,5 +1,9 @@
 # External Bidirectional Capture and Business Correlation
 
+This tool validates the boundary between market-data arrival and first-leg order submission. It combines application
+logs, local capture, external capture, and TLS record reconstruction, then reports measured latency and the portion
+that remains unassigned.
+
 Recommended wiring is trading host -> switch source port -> upstream, with ingress and egress mirrored to a
 dedicated capture interface. The capture host must not run the trading process. A network TAP is also suitable.
 Ensure both directions are captured and hardware timestamp clocks are aligned when multiple interfaces are used.
@@ -75,4 +79,6 @@ delta = (B_ack - B_data) - (A_ack - A_data)
 ```
 
 The report includes sample counts and P50, P95, P99, minimum, and maximum in microseconds. This estimates the
-additional observation path cost using real Binance TCP traffic; it is not an exchange RTT or business-processing time.
+additional observation path cost using real Binance TCP traffic. It estimates the difference between two observation
+paths and includes capture-host, mirror/TAP, driver, and timestamping effects; it is not a direct one-way propagation
+measurement, exchange RTT, or business-processing time.

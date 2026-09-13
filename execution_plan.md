@@ -38,11 +38,15 @@ account request is made between legs.
 Normal arbitrage orders use LIMIT/FOK; preflight cleanup uses LIMIT/IOC. The Gateway interface retains
 query/cancel for future extensions, but the low-latency path does not call them.
 
-`live_test_mode=true` accepts at most 10 cycles per process. Failed cycles and failed preflight checks count
-against the limit. Key files are read only in live mode and are never written to logs.
+`live_test_mode=true` defaults the process limit to two submitted cycles unless `max_cycles` is explicitly
+configured. Failed cycles and failed preflight checks count against the limit. Key files are read only in live
+mode and are never written to logs.
 
 ## Current Scope
 
 The implementation targets the normal fill path. It has no order-intent log, cross-process recovery, user-data
 WebSocket, automatic abnormal-position cleanup, clock-offset calibration, or full rate-limit scheduler. The
 default configuration remains paper mode and sends no real orders.
+
+The executor favors bounded, explicit failure handling over automatic retries. An ambiguous order result can leave
+an unknown exchange position, so the safe response is to enter `HALTED` and require external reconciliation.
