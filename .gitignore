@@ -9,3 +9,4 @@ __pycache__/
 *.key
 *.log
 build*
+benchmarks

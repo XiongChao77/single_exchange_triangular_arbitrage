@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <string_view>
 #include <nlohmann/json.hpp>
 
 namespace triangular::execution {
@@ -23,8 +24,9 @@ std::vector<Market> load_markets(const Config&, const nlohmann::json& exchange_i
 struct Options {
     std::chrono::milliseconds max_book_age{500};
     std::chrono::milliseconds execution_timeout{1000};
+    std::chrono::milliseconds initial_cleanup_wait{5000}; // Wait for initial books once at startup.
     unsigned max_initial_clear_orders = 6;
-    std::size_t max_cycles = 0; // Zero means unlimited; live test mode sets this to 10.
+    std::size_t max_cycles = 0; // Cap on arbitrage cycles submitted to the gateway; startup cleanup is separate; zero means unlimited.
 };
 
 enum class OrderStatus { Open, PartiallyFilled, Filled, Canceled, Expired, Rejected, Unknown };
@@ -42,6 +44,7 @@ struct OrderReport {
     Decimal filled_qty = 0, filled_quote = 0;
     Balances commissions; // CUMULATIVE per asset, not the last fill's commission.
     bool accounting_complete = true; // Terminal state may precede retrieval of all trades/fees.
+    nlohmann::json failure = nlohmann::json::object(); // Sanitized gateway failure diagnostics.
 };
 
 // All methods/callbacks run on the SAME single io_context thread as the executor.
@@ -63,12 +66,14 @@ const char* state_name(State);
 class ArbitrageExecutor {
 public:
     using Observer = std::function<void(const nlohmann::json&)>;
+    using EventObserver = std::function<void(std::string_view, const nlohmann::json&)>;
     ArbitrageExecutor(boost::asio::io_context&, const Config&, OrderBookManager&,
-                      std::vector<Market>, Gateway&, Options = {}, Observer = {});
+                      std::vector<Market>, Gateway&, Options = {}, Observer = {}, EventObserver = {});
     ~ArbitrageExecutor();
     ArbitrageExecutor(const ArbitrageExecutor&) = delete;
     ArbitrageExecutor& operator=(const ArbitrageExecutor&) = delete;
     // Call ONLY on the io_context thread. Occupies execution synchronously, then posts validation.
+    void start_initial_cleanup(); // Call once at program startup, after starting the receiver.
     bool try_start(const ArbitrageOpportunity&);
     void on_report(const OrderReport&); // Optional normalized user-data-stream reports.
     void stop(); // Reject new cycles; an active cycle is halted without automatic cleanup.

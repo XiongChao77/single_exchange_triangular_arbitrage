@@ -2,6 +2,7 @@
 #include "triangular/logger.hpp"
 #include <boost/asio/post.hpp>
 #include <deque>
+#include <cmath>
 #include <iostream>
 
 using namespace triangular;
@@ -27,7 +28,7 @@ std::vector<Market> markets() {
 }
 void populate(OrderBookManager& books) {
     auto put=[&](std::size_t index,const char* symbol,const char* bid,const char* ask) {
-        auto b=decode_best_bid_ask({{"s",symbol},{"u",1},{"b",bid},{"a",ask},{"B","1000"},{"A","1000"}},0);
+        auto b=decode_partial_depth({{"stream",std::string(symbol)+"@depth20@100ms"},{"data",{{"lastUpdateId",1},{"bids",nlohmann::json::array({nlohmann::json::array({bid,"1000"})})},{"asks",nlohmann::json::array({nlohmann::json::array({ask,"1000"})})}}}},0);
         b.received_steady_ns=steady_time_ns(); books.update(index,b);
     };
     put(0,"AB","2.00","2.01"); put(1,"AUSDT","9.99","10.00"); put(2,"BUSDT","6.00","6.01");
@@ -37,14 +38,16 @@ enum class Action { Fill, Reject, Open, Unknown };
 struct FakeGateway : Gateway {
     boost::asio::io_context& io; std::vector<Market> definitions=markets();
     Balances wallet{{"USDT",1000},{"BNB",5}}; std::deque<Action> actions;
-    std::vector<OrderRequest> requests; unsigned queries=0,cancels=0; bool duplicate=false;
+    std::vector<OrderRequest> requests; unsigned queries=0,cancels=0; bool duplicate=false, throw_submit=false;
     std::function<void(std::size_t)> after_fill;
+    nlohmann::json failure = nlohmann::json::object();
     explicit FakeGateway(boost::asio::io_context& context):io(context) {}
     Balances balances() const override { return wallet; }
     void submit(const OrderRequest& request, Callback callback) override {
+        if (throw_submit) throw std::runtime_error("Synthetic submit failure");
         requests.push_back(request); const Action action=actions.empty()?Action::Fill:actions.front();
         if (!actions.empty()) actions.pop_front();
-        OrderReport report; report.client_id=request.client_id; report.revision=1;
+        OrderReport report; report.client_id=request.client_id; report.revision=1; report.failure=failure;
         if(action==Action::Reject) report.status=OrderStatus::Rejected;
         else if(action==Action::Open) report.status=OrderStatus::Open;
         else if(action==Action::Unknown) report.status=OrderStatus::Unknown;
@@ -96,6 +99,8 @@ void tests() {
     }
     {
         Fixture f; f.gateway.wallet["A"]=Decimal("1"); ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options());
+        e.start_initial_cleanup(); f.run();
+        check(e.stats()["submitted_cycles"]==0 && e.stats()["startup_orders_submitted"]==1, "Startup consumed cycle cap");
         e.try_start(f.opportunity); f.run();
         check(f.gateway.requests.size()==4 && f.gateway.requests.front().initial_clear &&
               f.gateway.requests.front().symbol_index==1 && !f.gateway.requests.front().buy,"Initial asset not cleared");
@@ -110,6 +115,246 @@ void tests() {
         Fixture f; auto b=*f.books.get(1); b.received_steady_ns=1; f.books.update(1,b);
         ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options()); e.try_start(f.opportunity); f.run();
         check(e.state()==State::Idle && f.gateway.requests.empty(),"Stale initial book accepted");
+    }
+    {
+        Fixture f; auto o=options(); o.max_cycles=1;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,o);
+        f.gateway.wallet["USDT"]=0;
+        for(int i=0;i<3;++i) { check(e.try_start(f.opportunity),"Unsubmitted attempts consumed cap"); f.run(); }
+        check(e.stats()["submitted_cycles"]==0 && e.stats()["rejection"]["code"]=="insufficient_usdt",
+              "Balance rejection diagnostic/counter missing");
+        f.gateway.wallet["USDT"]=1000;
+        check(e.try_start(f.opportunity),"Funded retry rejected"); f.run();
+        check(e.stats()["submitted_cycles"]==1 && f.gateway.requests.size()==3,"Cycle counted more than once");
+        check(!e.try_start(f.opportunity),"Submitted cycle did not consume cap");
+    }
+    {
+        Fixture f; auto o=options(); o.max_cycles=1;
+        auto b=*f.books.get(1); b.received_steady_ns=1; f.books.update(1,b);
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,o);
+        e.try_start(f.opportunity); f.run();
+        auto d=e.stats()["rejection"];
+        check(d["code"]=="stale_orderbook" && d["symbol"]=="AUSDT" && d["leg"]==0 &&
+              d.contains("book_age_ns"),"Stale rejection lacks details");
+        populate(f.books);
+        check(e.try_start(f.opportunity),"Stale preflight consumed cap"); f.run();
+        check(e.stats()["completed"]==1 && e.stats()["rejection"].empty(),"Fresh retry failed or retained rejection");
+    }
+    {
+        Fixture f; auto m=markets(); m[1].min_notional=1000;
+        ArbitrageExecutor e(f.io,f.config,f.books,m,f.gateway,options()); e.try_start(f.opportunity); f.run();
+        auto d=e.stats()["rejection"];
+        check(d["code"]=="notional_below_min" && d.contains("notional") && d["min_notional"]=="1000",
+              "Market filter rejection lacks values");
+        check(f.gateway.requests.empty(),"Invalid notional submitted");
+    }
+    {
+        Fixture f; auto b=*f.books.get(1); b.ask_qty=0; f.books.update(1,b);
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options()); e.try_start(f.opportunity); f.run();
+        check(e.stats()["rejection"]["code"]=="insufficient_top_level_liquidity", "Liquidity diagnostic missing");
+    }
+    {
+        Fixture f; auto candidate=f.opportunity; candidate.prices[0]=9;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options()); e.try_start(candidate); f.run();
+        check(e.stats()["rejection"]["code"]=="price_worsened", "Price diagnostic missing");
+    }
+    for (const double threshold : {0.0, 0.1, 0.3}) {
+        Fixture f; auto c=f.config; c.edge_threshold=threshold;
+        OrderBookManager books(c); populate(books);
+        ArbitrageOpportunity candidate;
+        const bool found=books.scan_edge(0,candidate);
+        check(found==(threshold<0.19), "Scanner ignored theoretical return threshold");
+        if(found) {
+            const long double expected=1.2L*std::pow(1.0L-c.commission_taker,3)-1.0L;
+            check(std::abs(candidate.net_return-expected)<1e-15L,
+                  "Scanner return is not the three-leg theoretical spread");
+        } else check(candidate.input_usdt==0, "Rejected scan retained opportunity");
+    }
+    {
+        Fixture f; auto m=markets(); m[0].step=Decimal("7");
+        ArbitrageExecutor e(f.io,f.config,f.books,m,f.gateway,options());
+        ArbitrageOpportunity candidate;
+        check(f.books.scan_edge(0,candidate) && e.try_start(candidate), "Step rounding affected theoretical scan");
+        f.run();
+        check(e.stats()["completed"]==1 && f.gateway.requests.size()==3 &&
+              f.gateway.wallet["USDT"]<1000 && e.stats()["rejection"].empty(),
+              "Executor reapplied cash-return profitability check");
+    }
+    {
+        Fixture f; auto c=f.config; c.commission_taker=0; c.edge_threshold=5;
+        OrderBookManager books(c); populate(books);
+        auto first=*books.get(1); first.ask_price=1; first.bid_price=1; first.price_exponent=0; books.update(1,first);
+        auto middle=*books.get(0); middle.bid_price=2; middle.ask_price=3; middle.price_exponent=0; books.update(0,middle);
+        auto last=*books.get(2); last.bid_price=3; last.ask_price=4; last.price_exponent=0; books.update(2,last);
+        ArbitrageOpportunity candidate;
+        check(!books.scan_edge(0,candidate), "Return equal to threshold was accepted");
+    }
+    {
+        Fixture f; f.gateway.actions={Action::Reject}; auto o=options(); o.max_cycles=1;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,o); e.try_start(f.opportunity); f.run();
+        check(e.stats()["submitted_cycles"]==1 && !e.try_start(f.opportunity),"Rejected submitted order did not consume cap");
+    }
+    {
+        Fixture f; f.gateway.wallet["USDT"]=0; f.gateway.wallet["A"]=Decimal("0.0005");
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options());
+        e.start_initial_cleanup(); f.run();
+        for(int i=0;i<5;++i) {
+            check(e.try_start(f.opportunity),"Dust retry rejected"); f.run();
+            check(e.stats()["dust"]["A"]=="0.0005", "Same dust balance accumulated across retries");
+        }
+        f.gateway.wallet["A"]=Decimal("0.0007");
+        e.try_start(f.opportunity); f.run();
+        check(e.stats()["dust"]["A"]=="0.0005", "Startup dust snapshot changed during arbitrage");
+        f.gateway.wallet["A"]=0;
+        e.try_start(f.opportunity); f.run();
+        e.start_initial_cleanup(); f.run();
+        check(e.stats()["dust"]["A"]=="0.0005", "Cleanup ran more than once");
+        check(f.gateway.requests.empty(), "Dust-only retries sent orders");
+    }
+    {
+        Fixture f; f.gateway.wallet["A"]=Decimal("1.0005"); f.gateway.duplicate=true;
+        std::vector<std::pair<std::string,nlohmann::json>> events;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options(),{},
+            [&](std::string_view name,const nlohmann::json& fields){ if(name.starts_with("arbitrage_first_leg_")) events.emplace_back(name,fields); });
+        e.start_initial_cleanup(); f.run();
+        e.try_start(f.opportunity); f.run();
+        check(events.size()==3 && events[0].first=="arbitrage_first_leg_submit_attempt" &&
+              events[1].first=="arbitrage_first_leg_submitted" && events[2].first=="arbitrage_first_leg_report",
+              "First-leg events duplicated or missing");
+        const auto& first=f.gateway.requests[1];
+        for(const auto& event:events) {
+            check(event.second["client_id"]==first.client_id && event.second["symbol"]=="AUSDT" &&
+                  event.second["side"]=="BUY" && event.second["leg"]==0 &&
+                  event.second["time_in_force"]=="FOK", "First-leg event confused clearing/later leg");
+        }
+        check(events[2].second["order_status"]=="FILLED" &&
+              events[2].second["filled_qty"]==first.quantity, "First-leg fill details missing");
+        check(e.stats()["startup_cleanup_results"]["A"]["remaining_balance"]=="0.0005", "Clearing remainder incorrect");
+    }
+    {
+        Fixture f; f.gateway.throw_submit=true;
+        std::vector<std::string> events;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options(),{},
+            [&](std::string_view name,const nlohmann::json&){ events.emplace_back(name); });
+        e.try_start(f.opportunity); f.run();
+        check(events==std::vector<std::string>{"arbitrage_first_leg_submit_attempt","arbitrage_first_leg_submit_failed"},
+              "Throwing submit logged success");
+        check(e.state()==State::Halted && e.stats()["submitted_cycles"]==0,"Failed submit consumed cap");
+    }
+    {
+        Fixture f; auto b=*f.books.get(1); b.received_steady_ns=1; f.books.update(1,b);
+        unsigned events=0;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options(),{},
+            [&](std::string_view,const nlohmann::json&){ ++events; });
+        e.try_start(f.opportunity); f.run();
+        check(events==0,"Preflight failure logged first-leg submission");
+    }
+    for (const auto action : {Action::Reject,Action::Unknown}) {
+        Fixture f; f.gateway.actions={action}; std::vector<nlohmann::json> reports;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options(),{},
+            [&](std::string_view name,const nlohmann::json& fields){
+                if(name=="arbitrage_first_leg_report") reports.push_back(fields);
+            });
+        e.try_start(f.opportunity); f.run();
+        check(reports.size()==1 && reports[0]["order_status"]==(action==Action::Reject?"REJECTED":"UNKNOWN"),
+              "First-leg rejection/unknown report missing");
+    }
+    for (const auto action : {Action::Reject, Action::Unknown}) {
+        Fixture f; f.gateway.actions={action}; f.gateway.duplicate=true;
+        f.gateway.failure={{"stage","exchange_response"},{"http_status",400},
+            {"binance_code",-1013},{"binance_message","Filter failure: LOT_SIZE"},
+            {"outcome_uncertain",action==Action::Unknown}};
+        std::vector<std::pair<std::string,nlohmann::json>> events;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options(),{},
+            [&](std::string_view name,const nlohmann::json& fields){events.emplace_back(name,fields);});
+        e.try_start(f.opportunity); f.run();
+        unsigned errors=0, reports=0;
+        for(const auto& [name,fields]:events) {
+            if(name=="execution_order_failed" || name=="arbitrage_first_leg_report") {
+                check(fields["failure"]==f.gateway.failure,"Failure diagnostics lost in event");
+                if(name=="execution_order_failed") ++errors; else ++reports;
+            }
+        }
+        check(errors==1 && reports==1 && e.stats()["order_failure"]==f.gateway.failure,
+              "Missing or duplicated failure diagnostics");
+        if(action==Action::Reject) {
+            f.gateway.failure=nlohmann::json::object();
+            e.try_start(f.opportunity); f.run();
+            check(e.stats()["order_failure"].empty(),"New cycle retained previous order failure");
+        }
+    }
+    {
+        Fixture f; auto m=markets(); m[1].base="BNB"; m[1].symbol="BNBUSDT";
+        auto b=*f.books.get(1); b.received_steady_ns=1; f.books.update(1,b);
+        ArbitrageExecutor e(f.io,f.config,f.books,m,f.gateway,options());
+        e.start_initial_cleanup(); f.run();
+        check(e.state()==State::Idle && e.stats()["startup_cleanup_done"]==true &&
+              e.stats()["startup_cleanup_results"]["BNB"]["code"]=="protected_asset" &&
+              f.gateway.requests.empty() && f.gateway.wallet["BNB"]==5, "Startup sold BNB or waited for its book");
+    }
+    {
+        Fixture f; f.gateway.wallet["A"]=1; auto o=options(); o.max_cycles=2;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,o);
+        e.start_initial_cleanup(); f.run();
+        for(int i=0;i<2;++i) {
+            f.gateway.wallet["A"]+=1;
+            e.start_initial_cleanup();
+            check(e.try_start(f.opportunity), "Startup consumed arbitrage allowance"); f.run();
+        }
+        check(f.gateway.requests.size()==7 && e.stats()["startup_orders_submitted"]==1 &&
+              e.stats()["submitted_cycles"]==2 && !e.try_start(f.opportunity), "Later cycles repeated startup cleanup");
+        for(std::size_t i=1;i<f.gateway.requests.size();++i)
+            check(!f.gateway.requests[i].initial_clear, "Later cycle swept deposited balance");
+    }
+    {
+        Fixture f; f.gateway.wallet["A"]=1; auto o=options(); o.initial_cleanup_wait=std::chrono::milliseconds(1);
+        auto b=*f.books.get(1); b.received_steady_ns=1; f.books.update(1,b);
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,o);
+        e.start_initial_cleanup();
+        check(!e.try_start(f.opportunity), "Arbitrage overlapped startup cleanup"); f.run();
+        check(e.state()==State::Idle && e.stats()["startup_cleanup_done"]==true &&
+              e.stats()["startup_cleanup_results"]["A"]["code"]=="stale_orderbook" &&
+              f.gateway.requests.empty(), "Stale startup book halted execution");
+        populate(f.books); e.try_start(f.opportunity); f.run();
+        check(f.gateway.requests.size()==3 && !f.gateway.requests[0].initial_clear, "Skipped startup asset retried later");
+    }
+    {
+        Fixture f; f.gateway.wallet["A"]=1; f.gateway.actions={Action::Reject};
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options());
+        e.start_initial_cleanup(); f.run();
+        check(e.state()==State::Idle && f.gateway.requests.size()==1 &&
+              e.stats()["startup_cleanup_results"]["A"]["code"]=="not_filled", "Rejected startup order repeated or halted");
+        e.try_start(f.opportunity); f.run();
+        check(f.gateway.requests.size()==4 && !f.gateway.requests[1].initial_clear, "Rejected cleanup retried in cycle");
+    }
+    {
+        Fixture f; f.gateway.wallet["A"]=1; f.gateway.actions={Action::Unknown};
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options());
+        e.start_initial_cleanup(); f.run();
+        check(e.state()==State::Halted && f.gateway.requests.size()==1 && !e.try_start(f.opportunity),
+              "Unknown startup order allowed further trading");
+    }
+    {
+        Fixture f; f.gateway.wallet["BTTC"]=Decimal("0.9"); f.gateway.wallet["A"]=Decimal("0.0005");
+        unsigned states=0, finished=0, skipped_bttc=0;
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,options(),
+            [&](const nlohmann::json& fields) {
+                ++states;
+                check(!fields.contains("startup_cleanup_results") && !fields.contains("dust"),
+                      "Execution state repeated startup details");
+            }, [&](std::string_view name,const nlohmann::json& fields) {
+                if(name=="startup_cleanup_finished") {
+                    ++finished;
+                    check(fields["results"]["BTTC"]["balance"]=="0.9" && fields["dust"]["A"]=="0.0005",
+                          "Startup summary lost cleanup details");
+                }
+                if(name=="startup_cleanup_skipped" && fields["asset"]=="BTTC") ++skipped_bttc;
+            });
+        e.start_initial_cleanup(); f.run();
+        for(int i=0;i<2;++i) { e.try_start(f.opportunity); f.run(); }
+        e.start_initial_cleanup(); f.run();
+        check(states>5 && finished==1 && skipped_bttc==1 && e.stats()["startup_cleanup_results"].contains("BTTC"),
+              "Startup details repeated or final summary lost");
     }
     {
         Fixture f; PaperGateway gateway(f.io,f.books,markets(),Decimal(f.config.commission_taker),{{"USDT",1000}});

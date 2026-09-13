@@ -41,7 +41,7 @@ int main() {
             options.execution_timeout = std::chrono::milliseconds(config.execution_timeout_ms);
             if (config.execution_mode == "paper") {
                 gateway = std::make_unique<triangular::execution::PaperGateway>(io, orderbooks, markets,
-                    triangular::execution::Decimal(config.commission_taker),
+                    triangular::execution::Decimal(nlohmann::json(config.commission_taker).dump()),
                     triangular::execution::Balances{{"USDT", triangular::execution::Decimal(config.max_arbitrage_usdt)}});
             } else {
                 gateway = std::make_unique<triangular::execution::BinanceGateway>(io, config, markets);
@@ -50,6 +50,10 @@ int main() {
             executor = std::make_unique<triangular::execution::ArbitrageExecutor>(io, config, orderbooks,
                 std::move(markets), *gateway, options, [&](const nlohmann::json& status) {
                     logger.log("INFO", "execution_state", status);
+                }, [&](std::string_view event, const nlohmann::json& fields) {
+                    const bool error = event == "execution_order_failed" || event == "arbitrage_first_leg_submit_failed" ||
+                        fields.value("order_status", std::string()) == "UNKNOWN";
+                    logger.log(error ? "ERROR" : "INFO", std::string(event), fields);
                 });
         }
         triangular::Receiver receiver(std::move(config), orderbooks, logger,

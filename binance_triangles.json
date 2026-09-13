@@ -1,15 +1,4 @@
 {
-  "host": "stream.binance.com",
-  "port": "9443",
-  "execution_mode": "live",
-  "live_test_mode": true,
-  "api_key_file": "/home/chao/work/financial-ml-system/LiveTrading/binance/main/hmac_api_key",
-  "secret_key_file": "/home/chao/work/financial-ml-system/LiveTrading/binance/main/hmac_secret",
-  "execution_timeout_ms": 1000,
-  "max_arbitrage_usdt": 20,
-  "commission_taker": 0.0001,
-  "commission_maker": 0.0001,
-  "edge_threshold":  0,
   "triangles": [
     [
       "ETHUSDT",

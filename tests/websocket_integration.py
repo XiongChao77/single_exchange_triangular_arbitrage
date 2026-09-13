@@ -97,6 +97,9 @@ def main():
             assert process.returncode==0,(stdout,stderr)
             rows=[json.loads(line) for line in max((root/"logs").glob("*.jsonl")).read_text().splitlines()]
             events=lambda name:[row["fields"] for row in rows if row["event"]==name]
+            assert not any(row["event"].startswith("startup_cleanup_") for row in rows), "Startup cleanup ran"
+            execution=events("execution_final")[0]
+            assert execution["startup_cleanup_started"] is False and execution["startup_orders_submitted"]==0,execution
             final=events("pipeline_final")[0]
             count=final["orderbook_store"]["received"]
             assert final["orderbook_store"]=={"received":count,"symbols":5,"populated":5},final

@@ -4,6 +4,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <algorithm>
 #include <sstream>
+#include <set>
 
 namespace triangular::execution {
 namespace {
@@ -93,11 +94,19 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     Gateway& gateway;
     Options options;
     Observer observer;
-    boost::asio::steady_timer timeout;
+    EventObserver event_observer;
+    boost::asio::steady_timer timeout, cleanup_wait;
+    bool cleanup_started = false, cleanup_done = false;
+    std::int64_t cleanup_deadline_ns = 0;
+    std::set<std::string> cleanup_processed;
+    std::uint64_t startup_orders_submitted = 0;
+    nlohmann::json cleanup_results = nlohmann::json::object();
     State state = State::Idle;
-    bool stopping = false, failed = false;
+    bool stopping = false, failed = false, cycle_submitted = false;
+    nlohmann::json rejection = nlohmann::json::object();
+    nlohmann::json order_failure = nlohmann::json::object();
     std::string reason, cycle;
-    std::uint64_t next_cycle = 0, accepted = 0, completed = 0, failures = 0;
+    std::uint64_t next_cycle = 0, accepted = 0, submitted_cycles = 0, completed = 0, failures = 0;
     std::uint64_t rejected_busy = 0, rejected_limit = 0;
     unsigned order_number = 0, clear_orders = 0;
     std::size_t leg_number = 0;
@@ -108,21 +117,24 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     OrderReport accounted;
 
     Impl(boost::asio::io_context& context, const Config& c, OrderBookManager& manager,
-         std::vector<Market> market_list, Gateway& order_gateway, Options execution_options, Observer obs)
+         std::vector<Market> market_list, Gateway& order_gateway, Options execution_options, Observer obs, EventObserver events)
         : io(context), config(c), books(manager), markets(std::move(market_list)), gateway(order_gateway),
-          options(std::move(execution_options)), observer(std::move(obs)), timeout(io) {
+          options(std::move(execution_options)), observer(std::move(obs)), event_observer(std::move(events)), timeout(io), cleanup_wait(io) {
         if (markets.size() != config.symbols.size() || options.max_book_age.count() <= 0 ||
-            options.execution_timeout.count() <= 0 || !options.max_initial_clear_orders)
+            options.execution_timeout.count() <= 0 || options.initial_cleanup_wait.count() <= 0 || !options.max_initial_clear_orders)
             throw std::runtime_error("Invalid execution options");
     }
 
     nlohmann::json status() const {
         nlohmann::json result = {{"state", state_name(state)}, {"cycle_id", cycle}, {"reason", reason},
-            {"accepted", accepted}, {"completed", completed}, {"failed", failures},
+            {"accepted", accepted}, {"submitted_cycles", submitted_cycles},
+            {"cycle_submitted", cycle_submitted}, {"rejection", rejection}, {"order_failure", order_failure}, {"completed", completed}, {"failed", failures},
             {"rejected_busy", rejected_busy}, {"rejected_limit", rejected_limit},
             {"max_cycles", options.max_cycles}, {"holdings", balance_json(holdings)},
             {"dust", balance_json(dust)}, {"budget_usdt", decimal_text(budget)},
-            {"leg", leg_number}, {"stopping", stopping}};
+            {"leg", leg_number}, {"stopping", stopping},
+            {"startup_cleanup_started", cleanup_started}, {"startup_cleanup_done", cleanup_done},
+            {"startup_orders_submitted", startup_orders_submitted}, {"startup_cleanup_results", cleanup_results}};
         if (pending) result["pending"] = {{"client_id", pending->client_id},
             {"symbol_index", pending->symbol_index}, {"buy", pending->buy},
             {"price", pending->price}, {"quantity", pending->quantity},
@@ -131,33 +143,79 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         return result;
     }
 
-    void publish() const { if (observer) observer(status()); }
+    void publish() const {
+        if (!observer) return;
+        auto fields = status();
+        fields.erase("startup_cleanup_results");
+        fields.erase("dust");
+        observer(fields);
+    }
     void halt(std::string why) {
-        timeout.cancel(); state = State::Halted; reason = std::move(why); ++failures; publish();
+        timeout.cancel(); cleanup_wait.cancel(); state = State::Halted; reason = std::move(why); ++failures; publish();
     }
     bool fresh(const OrderBook& book) const {
         const auto age = steady_time_ns() - book.received_steady_ns;
         return book.received_steady_ns > 0 && age >= 0 &&
             age <= std::chrono::duration_cast<std::chrono::nanoseconds>(options.max_book_age).count();
     }
-    bool valid(const Market& market, const Decimal& price, const Decimal& quantity) const {
-        return price > 0 && quantity > 0 && (market.min_price == 0 || price >= market.min_price) &&
-            (market.max_price == 0 || price <= market.max_price) && quantity >= market.min_qty &&
-            (market.max_qty == 0 || quantity <= market.max_qty) && price * quantity >= market.min_notional &&
-            (market.max_notional == 0 || price * quantity <= market.max_notional);
+    bool valid(const Market& market, const Decimal& price, const Decimal& quantity,
+               nlohmann::json* detail = nullptr) const {
+        const char* code = nullptr;
+        if (price <= 0) code = "nonpositive_price";
+        else if (quantity <= 0) code = "nonpositive_quantity";
+        else if (market.min_price != 0 && price < market.min_price) code = "price_below_min";
+        else if (market.max_price != 0 && price > market.max_price) code = "price_above_max";
+        else if (quantity < market.min_qty) code = "quantity_below_min";
+        else if (market.max_qty != 0 && quantity > market.max_qty) code = "quantity_above_max";
+        else if (price * quantity < market.min_notional) code = "notional_below_min";
+        else if (market.max_notional != 0 && price * quantity > market.max_notional) code = "notional_above_max";
+        if (code && detail) {
+            (*detail)["code"] = code;
+            (*detail)["min_price"] = decimal_text(market.min_price);
+            (*detail)["max_price"] = decimal_text(market.max_price);
+            (*detail)["min_quantity"] = decimal_text(market.min_qty);
+            (*detail)["max_quantity"] = decimal_text(market.max_qty);
+            (*detail)["min_notional"] = decimal_text(market.min_notional);
+            (*detail)["max_notional"] = decimal_text(market.max_notional);
+        }
+        return code == nullptr;
     }
 
     std::optional<OrderRequest> prepare_from_book(const TradeLeg& leg, const Decimal& amount,
-            bool initial_clear, const std::vector<std::optional<OrderBook>>& snapshot) const {
+            bool initial_clear, const std::vector<std::optional<OrderBook>>& snapshot,
+            nlohmann::json* detail = nullptr) const {
         const auto& book = snapshot.at(leg.index);
-        if (!book || !fresh(*book)) return {};
+        if (!book || !fresh(*book)) {
+            if (detail) {
+                (*detail)["code"] = book ? "stale_orderbook" : "missing_orderbook";
+                (*detail)["max_book_age_ms"] = options.max_book_age.count();
+                if (book) {
+                    (*detail)["book_age_ns"] = steady_time_ns() - book->received_steady_ns;
+                    (*detail)["book_update_id"] = book->book_update_id;
+                }
+            }
+            return {};
+        }
         const auto& market = markets.at(leg.index);
         const Decimal raw_price = price_of(*book, leg.buy), liquidity = quantity_of(*book, leg.buy);
         const Decimal price = leg.buy ? Decimal(ceil(raw_price / market.tick) * market.tick)
                                       : down(raw_price, market.tick);
         Decimal quantity = down(leg.buy ? amount / price : amount, market.step);
         if (initial_clear) quantity = down(std::min(quantity, liquidity), market.step);
-        if (!valid(market, price, quantity) || quantity > liquidity) return {};
+        if (detail) {
+            (*detail)["price"] = decimal_text(price);
+            (*detail)["quantity"] = decimal_text(quantity);
+            (*detail)["notional"] = decimal_text(price * quantity);
+            (*detail)["liquidity"] = decimal_text(liquidity);
+            (*detail)["input_amount"] = decimal_text(amount);
+            (*detail)["tick_size"] = decimal_text(market.tick);
+            (*detail)["step_size"] = decimal_text(market.step);
+        }
+        if (!valid(market, price, quantity, detail)) return {};
+        if (quantity > liquidity) {
+            if (detail) (*detail)["code"] = "insufficient_top_level_liquidity";
+            return {};
+        }
         return OrderRequest{"", leg.index, leg.buy, decimal_text(price), decimal_text(quantity), initial_clear};
     }
 
@@ -170,18 +228,25 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         return OrderRequest{"", leg.index, leg.buy, decimal_text(price), decimal_text(quantity), false};
     }
 
-    bool preflight() const {
+    bool preflight() {
         auto balances = holdings;
         const auto snapshot = books.snapshot();
-        const Decimal fee = Decimal(1) - Decimal(config.commission_taker);
+        const Decimal fee = Decimal(1) - Decimal(nlohmann::json(config.commission_taker).dump());
         for (std::size_t i = 0; i < opportunity.path.size(); ++i) {
             const auto& leg = opportunity.path[i];
             const auto& market = markets.at(leg.index);
-            const auto order = prepare_from_book(leg, balances[leg.buy ? market.quote : market.base], false, snapshot);
-            if (!order) return false;
+            rejection = {{"stage", "initial_preflight"}, {"leg", i},
+                {"symbol", market.symbol}, {"side", leg.buy ? "BUY" : "SELL"}};
+            const auto order = prepare_from_book(leg, balances[leg.buy ? market.quote : market.base], false, snapshot, &rejection);
+            if (!order) { reason = "Initial preflight failed: " + rejection.at("code").get<std::string>(); return false; }
             const Decimal price(order->price), quantity(order->quantity);
             const Decimal accepted_price = floor(Decimal(opportunity.prices[i]) / market.tick + Decimal("0.5")) * market.tick;
-            if ((leg.buy && price > accepted_price) || (!leg.buy && price < accepted_price)) return false;
+            if ((leg.buy && price > accepted_price) || (!leg.buy && price < accepted_price)) {
+                rejection["code"] = "price_worsened";
+                rejection["accepted_price"] = decimal_text(accepted_price);
+                reason = "Initial preflight failed: price_worsened";
+                return false;
+            }
             if (leg.buy) {
                 balances[market.quote] -= price * quantity;
                 balances[market.base] += quantity * fee;
@@ -190,59 +255,114 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
                 balances[market.quote] += quantity * price * fee;
             }
         }
-        return balances["USDT"] > budget * (Decimal(1) + Decimal(config.edge_threshold));
+        rejection = nlohmann::json::object();
+        return true;
     }
 
     void start_arbitrage() {
         holdings = {{"USDT", budget}};
-        if (!preflight()) { failed = true; reason = "Initial preflight failed"; finish(); return; }
+        if (!preflight()) { failed = true; finish(); return; }
         leg_number = 0;
         next_leg();
     }
 
+    void cleanup_event(std::string_view event, const nlohmann::json& fields) const {
+        if (event_observer) event_observer(event, fields);
+    }
+    void arm_timeout() {
+        timeout.expires_after(options.execution_timeout);
+        timeout.async_wait([weak = weak_from_this()](const boost::system::error_code& error) {
+            if (!error)
+                if (auto self = weak.lock(); self && self->state != State::Idle && self->state != State::Halted)
+                    self->halt("Execution timeout");
+        });
+    }
     void clear_initial_position() {
-        state = State::ClearingInitialPosition;
+        if (stopping || state == State::Halted || cleanup_done || pending) return;
         const auto snapshot = books.snapshot();
+        bool waiting = false;
         for (auto& [asset, amount] : holdings) {
-            if (asset == "USDT" || amount <= 0) continue;
+            if (amount <= 0 || cleanup_processed.contains(asset)) continue;
+            auto skip = [&](const char* code, nlohmann::json detail = nlohmann::json::object()) {
+                cleanup_processed.insert(asset);
+                detail["code"] = code;
+                detail["balance"] = decimal_text(amount);
+                cleanup_results[asset] = detail;
+                detail["asset"] = asset;
+                cleanup_event("startup_cleanup_skipped", detail);
+            };
+            if (asset == "USDT" || asset == "BNB") { skip("protected_asset"); continue; }
             std::optional<TradeLeg> exit_leg;
-            for (const auto index : config.trading_groups.at(opportunity.group_index).symbol_indices) {
+            for (std::size_t index = 0; index < markets.size(); ++index) {
                 const auto& candidate = markets[index];
-                if (candidate.base == asset && candidate.quote == "USDT") exit_leg = TradeLeg{index, false};
-                else if (candidate.base == "USDT" && candidate.quote == asset) exit_leg = TradeLeg{index, true};
+                if (candidate.base == asset && candidate.quote == "USDT") { exit_leg = TradeLeg{index, false}; break; }
+                if (candidate.base == "USDT" && candidate.quote == asset) exit_leg = TradeLeg{index, true};
             }
-            if (!exit_leg) { halt("No USDT market for initial asset"); return; }
+            if (!exit_leg) { skip("no_usdt_market"); continue; }
             const auto& market = markets.at(exit_leg->index);
             const auto& book = snapshot.at(exit_leg->index);
-            if (!book || !fresh(*book)) { halt("No fresh book for initial position clear"); return; }
+            if (!book || !fresh(*book)) {
+                if (steady_time_ns() < cleanup_deadline_ns) { waiting = true; continue; }
+                nlohmann::json detail = {{"symbol", market.symbol}};
+                if (book) detail["book_age_ns"] = steady_time_ns() - book->received_steady_ns;
+                skip(book ? "stale_orderbook" : "missing_orderbook", detail);
+                continue;
+            }
             const Decimal price = price_of(*book, exit_leg->buy);
+            if (price <= 0) { skip("nonpositive_price", {{"symbol", market.symbol}}); continue; }
             const Decimal quantity = down(exit_leg->buy ? amount / price : amount, market.step);
             if (quantity == 0 || quantity < market.min_qty || price * quantity < market.min_notional) {
-                dust[asset] += amount; amount = 0; continue;
+                dust[asset] = amount;
+                skip("dust", {{"symbol", market.symbol}, {"quantity", decimal_text(quantity)},
+                    {"notional", decimal_text(price * quantity)}, {"min_notional", decimal_text(market.min_notional)}});
+                continue;
             }
-            if (++clear_orders > options.max_initial_clear_orders) { halt("Initial position clear limit reached"); return; }
-            auto order = prepare_from_book(*exit_leg, amount, true, snapshot);
-            if (!order) { halt("Cannot clear initial position"); return; }
-            send(*order); return;
+            if (clear_orders >= options.max_initial_clear_orders) { skip("startup_order_limit"); continue; }
+            nlohmann::json detail = {{"symbol", market.symbol}};
+            auto order = prepare_from_book(*exit_leg, amount, true, snapshot, &detail);
+            if (!order) { const auto code = detail.at("code").get<std::string>(); skip(code.c_str(), detail); continue; }
+            cleanup_processed.insert(asset); // One submission attempt per initial asset; no remainder retries.
+            ++clear_orders;
+            cleanup_results[asset] = {{"code", "submit_attempt"}, {"initial_balance", decimal_text(amount)}};
+            arm_timeout();
+            send(*order);
+            return;
         }
-        start_arbitrage();
+        if (waiting) {
+            cleanup_wait.expires_after(std::chrono::milliseconds(50));
+            cleanup_wait.async_wait([weak = weak_from_this()](const boost::system::error_code& error) {
+                if (!error) if (auto self = weak.lock()) self->clear_initial_position();
+            });
+            return;
+        }
+        timeout.cancel(); cleanup_wait.cancel();
+        cleanup_done = true; state = State::Idle; pending.reset(); holdings.clear();
+        cleanup_event("startup_cleanup_finished", {{"startup_orders_submitted", startup_orders_submitted},
+            {"results", cleanup_results}, {"dust", balance_json(dust)}});
+        publish();
     }
-
+    void start_initial_cleanup() {
+        if (cleanup_started || stopping || state != State::Idle) return;
+        cleanup_started = true; state = State::ClearingInitialPosition;
+        cycle = "startup-" + std::to_string(wall_time_us());
+        holdings = gateway.balances(); // Snapshot once; later arbitrage cycles never sweep balances.
+        cleanup_deadline_ns = steady_time_ns() +
+            std::chrono::duration_cast<std::chrono::nanoseconds>(options.initial_cleanup_wait).count();
+        cleanup_event("startup_cleanup_started", {{"cycle_id", cycle}, {"protected_assets", {"USDT", "BNB"}},
+            {"wait_ms", options.initial_cleanup_wait.count()}});
+        publish();
+        clear_initial_position();
+    }
     void begin() {
         if (state != State::Validating || stopping) return;
         const auto account = gateway.balances();
         if (!account.contains("USDT") || account.at("USDT") < budget) {
+            rejection = {{"stage", "balance_check"}, {"code", "insufficient_usdt"},
+                {"available_usdt", decimal_text(account.contains("USDT") ? account.at("USDT") : Decimal(0))},
+                {"required_usdt", decimal_text(budget)}};
             failed = true; reason = "Insufficient USDT"; finish(); return;
         }
-        holdings = {{"USDT", budget}};
-        for (const auto index : config.trading_groups.at(opportunity.group_index).symbol_indices)
-            for (const auto& asset : {markets[index].base, markets[index].quote})
-                if (asset != "USDT" && account.contains(asset) && account.at(asset) > 0)
-                    holdings[asset] = account.at(asset);
-        const bool has_position = std::any_of(holdings.begin(), holdings.end(), [](const auto& item) {
-            return item.first != "USDT" && item.second > 0;
-        });
-        if (has_position) clear_initial_position(); else start_arbitrage();
+        start_arbitrage();
     }
 
     void next_leg() {
@@ -259,19 +379,57 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
             if (auto self = weak.lock()) self->report(report);
         };
     }
+    bool is_first_leg() const {
+        return pending && !pending->initial_clear && leg_number == 0;
+    }
+    void first_leg_event(std::string_view event, nlohmann::json extra = nlohmann::json::object()) const {
+        if (!event_observer || !is_first_leg()) return;
+        const auto& market = markets.at(pending->symbol_index);
+        nlohmann::json fields = {{"cycle_id", cycle}, {"client_id", pending->client_id},
+            {"group_index", opportunity.group_index}, {"leg", 0}, {"symbol", market.symbol},
+            {"side", pending->buy ? "BUY" : "SELL"}, {"type", "LIMIT"}, {"time_in_force", "FOK"},
+            {"price", pending->price}, {"quantity", pending->quantity},
+            {"execution_mode", config.execution_mode}, {"budget_usdt", decimal_text(budget)},
+            {"submitted_cycles", submitted_cycles}};
+        fields.update(extra);
+        event_observer(event, fields);
+    }
     void send(OrderRequest order) {
         order.client_id = cycle + "-" + std::to_string(++order_number);
         pending = std::move(order); accounted = {};
         state = pending->initial_clear ? State::ClearingInitialPosition : State::LegPending;
         publish();
-        try { gateway.submit(*pending, callback()); }
-        catch (const std::exception& error) { halt(std::string("Order submission failed: ") + error.what()); }
+        first_leg_event("arbitrage_first_leg_submit_attempt");
+        try {
+            gateway.submit(*pending, callback());
+            if (pending->initial_clear) ++startup_orders_submitted;
+            else if (!cycle_submitted) { cycle_submitted = true; ++submitted_cycles; }
+            first_leg_event("arbitrage_first_leg_submitted", {{"submission_boundary", "gateway"}});
+            publish();
+        }
+        catch (const std::exception& error) {
+            first_leg_event("arbitrage_first_leg_submit_failed", {{"error", error.what()}});
+            halt(std::string("Order submission failed: ") + error.what());
+        }
     }
 
     void report(const OrderReport& value) {
         if (!pending || value.client_id != pending->client_id || state == State::Halted) return;
-        if (value.status == OrderStatus::Unknown) { halt("Order outcome unknown"); return; }
         if (value.revision <= accounted.revision) return;
+        if (!value.failure.empty()) {
+            order_failure = value.failure;
+            if (event_observer) event_observer("execution_order_failed", {
+                {"cycle_id", cycle}, {"client_id", pending->client_id}, {"leg", leg_number},
+                {"symbol", markets.at(pending->symbol_index).symbol}, {"side", pending->buy ? "BUY" : "SELL"},
+                {"price", pending->price}, {"quantity", pending->quantity}, {"initial_clear", pending->initial_clear},
+                {"execution_mode", config.execution_mode},
+                {"order_status", value.status == OrderStatus::Unknown ? "UNKNOWN" : "REJECTED"},
+                {"failure", order_failure}});
+        }
+        if (value.status == OrderStatus::Unknown) {
+            first_leg_event("arbitrage_first_leg_report", {{"order_status", "UNKNOWN"}, {"revision", value.revision}, {"failure", value.failure}});
+            halt("Order outcome unknown"); return;
+        }
         const Decimal quantity_limit(pending->quantity);
         if (value.filled_qty < accounted.filled_qty || value.filled_qty > quantity_limit ||
             value.filled_quote < accounted.filled_quote) { halt("Invalid cumulative fill"); return; }
@@ -283,15 +441,35 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         for (const auto& [asset, commission] : value.commissions)
             holdings[asset] -= commission - accounted.commissions[asset];
         accounted = value;
+        const char* report_status = "UNKNOWN";
+        switch (value.status) {
+        case OrderStatus::Open: report_status = "OPEN"; break;
+        case OrderStatus::PartiallyFilled: report_status = "PARTIALLY_FILLED"; break;
+        case OrderStatus::Filled: report_status = "FILLED"; break;
+        case OrderStatus::Canceled: report_status = "CANCELED"; break;
+        case OrderStatus::Expired: report_status = "EXPIRED"; break;
+        case OrderStatus::Rejected: report_status = "REJECTED"; break;
+        case OrderStatus::Unknown: break;
+        }
+        first_leg_event("arbitrage_first_leg_report", {{"order_status", report_status},
+            {"revision", value.revision}, {"filled_qty", decimal_text(value.filled_qty)},
+            {"filled_quote", decimal_text(value.filled_quote)}, {"commissions", balance_json(value.commissions)},
+            {"accounting_complete", value.accounting_complete}, {"failure", value.failure}});
         publish();
         if (!terminal(value.status)) return;
         if (!value.accounting_complete) { halt("Incomplete fill accounting"); return; }
         const bool initial_clear = pending->initial_clear;
         const bool filled = value.status == OrderStatus::Filled && value.filled_qty == quantity_limit;
-        const bool made_progress = value.filled_qty > 0;
+        const auto asset = pending->buy ? market.quote : market.base;
+        const auto client_id = pending->client_id;
         pending.reset();
         if (initial_clear) {
-            if (!made_progress) { halt("Initial position clear did not fill"); return; }
+            timeout.cancel();
+            cleanup_results[asset].update({{"code", value.filled_qty > 0 ? "filled" : "not_filled"},
+                {"client_id", client_id}, {"symbol", market.symbol}, {"order_status", report_status},
+                {"filled_qty", decimal_text(value.filled_qty)}, {"filled_quote", decimal_text(value.filled_quote)},
+                {"remaining_balance", decimal_text(holdings[asset])}, {"failure", value.failure}});
+            cleanup_event("startup_cleanup_order_report", {{"asset", asset}, {"result", cleanup_results[asset]}});
             clear_initial_position(); return;
         }
         if (!filled) { failed = true; reason = "Arbitrage leg did not fill completely"; finish(); return; }
@@ -309,7 +487,7 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
 
     bool start(const ArbitrageOpportunity& candidate) {
         if (state != State::Idle || stopping) { ++rejected_busy; return false; }
-        if (options.max_cycles != 0 && accepted >= options.max_cycles) {
+        if (options.max_cycles != 0 && submitted_cycles >= options.max_cycles) {
             ++rejected_limit; publish(); return false;
         }
         if (candidate.group_index >= config.trading_groups.size() || candidate.input_usdt <= 0 ||
@@ -322,32 +500,28 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         });
         if (!known) return false;
         state = State::Validating; opportunity = candidate; budget = Decimal(candidate.input_usdt);
-        failed = false; reason.clear(); pending.reset(); holdings.clear();
-        leg_number = 0; order_number = 0; clear_orders = 0;
+        failed = false; cycle_submitted = false; reason.clear(); rejection = nlohmann::json::object(); order_failure = nlohmann::json::object(); pending.reset(); holdings.clear();
+        leg_number = 0; order_number = 0;
         cycle = std::to_string(wall_time_us()) + "-" + std::to_string(++next_cycle);
         ++accepted;
         publish();
-        timeout.expires_after(options.execution_timeout);
-        timeout.async_wait([weak = weak_from_this()](const boost::system::error_code& error) {
-            if (!error)
-                if (auto self = weak.lock(); self && self->state != State::Idle && self->state != State::Halted)
-                    self->halt("Execution timeout");
-        });
+        arm_timeout();
         boost::asio::post(io, [weak = weak_from_this()] { if (auto self = weak.lock()) self->begin(); });
         return true;
     }
 
     void stop() {
-        stopping = true;
+        stopping = true; cleanup_wait.cancel();
         if (state != State::Idle && state != State::Halted) halt("Stopped during execution");
     }
 };
 
 ArbitrageExecutor::ArbitrageExecutor(boost::asio::io_context& io, const Config& config,
-    OrderBookManager& books, std::vector<Market> markets, Gateway& gateway, Options options, Observer observer)
+    OrderBookManager& books, std::vector<Market> markets, Gateway& gateway, Options options, Observer observer, EventObserver events)
     : impl_(std::make_shared<Impl>(io, config, books, std::move(markets), gateway,
-                                  std::move(options), std::move(observer))) {}
-ArbitrageExecutor::~ArbitrageExecutor() { impl_->timeout.cancel(); }
+                                  std::move(options), std::move(observer), std::move(events))) {}
+ArbitrageExecutor::~ArbitrageExecutor() { impl_->timeout.cancel(); impl_->cleanup_wait.cancel(); }
+void ArbitrageExecutor::start_initial_cleanup() { impl_->start_initial_cleanup(); }
 bool ArbitrageExecutor::try_start(const ArbitrageOpportunity& opportunity) { return impl_->start(opportunity); }
 void ArbitrageExecutor::on_report(const OrderReport& report) { impl_->report(report); }
 void ArbitrageExecutor::stop() { impl_->stop(); }

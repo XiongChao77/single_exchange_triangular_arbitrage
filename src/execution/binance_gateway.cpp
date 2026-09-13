@@ -43,14 +43,18 @@ std::string read_secret(const std::filesystem::path& path) {
 struct HttpResult {
     unsigned status{};
     std::string body;
+    nlohmann::json diagnostics;
 };
 
 class RequestError : public std::runtime_error {
 public:
-    RequestError(std::string message, bool uncertain) : std::runtime_error(std::move(message)), uncertain_(uncertain) {}
+    RequestError(std::string message, bool uncertain, nlohmann::json details)
+        : std::runtime_error(std::move(message)), uncertain_(uncertain), details_(std::move(details)) {}
     bool uncertain() const { return uncertain_; }
+    const nlohmann::json& details() const { return details_; }
 private:
     bool uncertain_;
+    nlohmann::json details_;
 };
 
 OrderStatus order_status(const std::string& status) {
@@ -117,36 +121,99 @@ struct BinanceGateway::Impl : std::enable_shared_from_this<Impl> {
         if (worker.joinable()) worker.join();
     }
 
+    std::string safe_message(std::string message, const std::string& target = "") const {
+        auto redact = [&](const std::string& value) {
+            if (value.empty()) return;
+            std::size_t pos = 0;
+            while ((pos = message.find(value, pos)) != std::string::npos) {
+                message.replace(pos, value.size(), "[REDACTED]");
+                pos += 10;
+            }
+        };
+        // Redact before truncation, including an echoed signature without its key name.
+        const auto signature = target.find("signature=");
+        if (signature != std::string::npos) {
+            const auto start = signature + 10;
+            redact(target.substr(start, target.find('&', start) - start));
+        }
+        redact(target); redact(api_key); redact(secret_key);
+        if (message.size() > 1024) message.resize(1024);
+        return message;
+    }
+
     HttpResult request(http::verb method, const std::string& target) const {
-        net::io_context io;
-        ssl::context tls(ssl::context::tls_client);
-        tls.set_default_verify_paths();
-        if (!config.ca_file.empty()) tls.load_verify_file(config.ca_file.string());
-        tls.set_verify_mode(ssl::verify_peer);
-        if (SSL_CTX_set_min_proto_version(tls.native_handle(), TLS1_2_VERSION) != 1)
-            throw RequestError("Cannot configure Binance REST TLS", method == http::verb::post);
-        tcp::resolver resolver(io);
-        beast::ssl_stream<beast::tcp_stream> stream(io, tls);
-        stream.set_verify_callback(ssl::host_name_verification(config.rest_host));
-        if (SSL_set_tlsext_host_name(stream.native_handle(), config.rest_host.c_str()) != 1)
-            throw RequestError("Cannot configure Binance REST SNI", method == http::verb::post);
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
-        const auto endpoints = resolver.resolve(config.rest_host, config.rest_port);
-        beast::get_lowest_layer(stream).connect(endpoints);
-        stream.handshake(ssl::stream_base::client);
-        http::request<http::empty_body> req(method, target, 11);
-        req.set(http::field::host, config.rest_host);
-        req.set(http::field::user_agent, "single-exchange-triangular-arbitrage/0.1");
-        req.set("X-MBX-APIKEY", api_key);
-        http::write(stream, req);
-        beast::flat_buffer buffer;
-        http::response<http::string_body> response;
-        http::read(stream, buffer, response);
-        beast::error_code ec;
-        stream.shutdown(ec);
-        if (ec == net::error::eof || ec == ssl::error::stream_truncated) ec = {};
-        if (ec) throw RequestError("Binance REST TLS shutdown failed", method == http::verb::post);
-        return {response.result_int(), std::move(response.body())};
+        const auto begin = steady_time_ns();
+        const char* stage = "tls_setup";
+        bool write_started = false, write_completed = false;
+        nlohmann::json timing = nlohmann::json::object();
+        auto details = [&] {
+            return nlohmann::json{{"stage", stage}, {"origin", "transport"},
+                {"method", std::string(http::to_string(method))}, {"endpoint", target.substr(0, target.find('?'))},
+                {"request_write_started", write_started}, {"request_write_completed", write_completed},
+                {"elapsed_us", (steady_time_ns() - begin) / 1000}, {"timing_us", timing}};
+        };
+        try {
+            net::io_context io;
+            ssl::context tls(ssl::context::tls_client);
+            tls.set_default_verify_paths();
+            if (!config.ca_file.empty()) tls.load_verify_file(config.ca_file.string());
+            tls.set_verify_mode(ssl::verify_peer);
+            if (SSL_CTX_set_min_proto_version(tls.native_handle(), TLS1_2_VERSION) != 1)
+                throw std::runtime_error("Cannot configure Binance REST TLS");
+            tcp::resolver resolver(io);
+            beast::ssl_stream<beast::tcp_stream> stream(io, tls);
+            stream.set_verify_callback(ssl::host_name_verification(config.rest_host));
+            if (SSL_set_tlsext_host_name(stream.native_handle(), config.rest_host.c_str()) != 1)
+                throw std::runtime_error("Cannot configure Binance REST SNI");
+            beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
+            stage = "dns_resolve";
+            auto phase_begin = steady_time_ns();
+            const auto endpoints = resolver.resolve(config.rest_host, config.rest_port);
+            timing["dns"] = (steady_time_ns() - phase_begin) / 1000;
+            stage = "tcp_connect"; phase_begin = steady_time_ns();
+            beast::get_lowest_layer(stream).connect(endpoints);
+            timing["tcp_connect"] = (steady_time_ns() - phase_begin) / 1000;
+            stage = "tls_handshake"; phase_begin = steady_time_ns();
+            stream.handshake(ssl::stream_base::client);
+            timing["tls_handshake"] = (steady_time_ns() - phase_begin) / 1000;
+            stage = "request_build";
+            http::request<http::empty_body> req(method, target, 11);
+            req.set(http::field::host, config.rest_host);
+            req.set(http::field::user_agent, "single-exchange-triangular-arbitrage/0.1");
+            req.set("X-MBX-APIKEY", api_key);
+            stage = "http_write"; phase_begin = steady_time_ns(); write_started = true;
+            http::write(stream, req);
+            write_completed = true; timing["http_write"] = (steady_time_ns() - phase_begin) / 1000;
+            stage = "http_read"; phase_begin = steady_time_ns();
+            beast::flat_buffer buffer;
+            http::response<http::string_body> response;
+            http::read(stream, buffer, response);
+            timing["http_read"] = (steady_time_ns() - phase_begin) / 1000;
+            auto diagnostic = details();
+            diagnostic["http_status"] = response.result_int();
+            // A complete response establishes the outcome even if TLS shutdown fails.
+            beast::error_code ec;
+            stream.shutdown(ec);
+            if (ec && ec != net::error::eof && ec != ssl::error::stream_truncated)
+                diagnostic["tls_shutdown_error"] = safe_message(ec.message(), target);
+            return {response.result_int(), std::move(response.body()), std::move(diagnostic)};
+        } catch (const boost::system::system_error& error) {
+            auto diagnostic = details();
+            diagnostic["error_category"] = error.code().category().name();
+            diagnostic["error_code"] = error.code().value();
+            diagnostic["message"] = safe_message(error.what(), target);
+            const bool uncertain = method == http::verb::post && write_started;
+            diagnostic["outcome_uncertain"] = uncertain;
+            const auto message = diagnostic["message"].get<std::string>();
+            throw RequestError(message, uncertain, std::move(diagnostic));
+        } catch (const std::exception& error) {
+            auto diagnostic = details();
+            diagnostic["message"] = safe_message(error.what(), target);
+            const bool uncertain = method == http::verb::post && write_started;
+            diagnostic["outcome_uncertain"] = uncertain;
+            const auto message = diagnostic["message"].get<std::string>();
+            throw RequestError(message, uncertain, std::move(diagnostic));
+        }
     }
 
     std::string signed_target(const std::string& path, std::string parameters) const {
@@ -155,20 +222,38 @@ struct BinanceGateway::Impl : std::enable_shared_from_this<Impl> {
         return path + '?' + parameters + "&signature=" + hmac_sha256_hex(secret_key, parameters);
     }
 
-    nlohmann::json checked(http::verb method, const std::string& target, bool submission) const {
-        HttpResult response;
-        try { response = request(method, target); }
-        catch (const RequestError&) { throw; }
-        catch (const std::exception& error) { throw RequestError(error.what(), submission); }
+    nlohmann::json checked(http::verb method, const std::string& target, bool submission,
+                           nlohmann::json* request_info = nullptr) const {
+        const auto response = request(method, target);
+        if (request_info) *request_info = response.diagnostics;
         auto body = nlohmann::json::parse(response.body, nullptr, false);
-        const int code = body.is_object() && body.contains("code") && body["code"].is_number_integer()
-            ? body["code"].get<int>() : 0;
-        if (response.status < 200 || response.status >= 300 || body.is_discarded()) {
-            const bool uncertain = submission && (response.status >= 500 || code == -1007);
-            throw RequestError("Binance REST request failed: HTTP " + std::to_string(response.status) +
-                               " code " + std::to_string(code), uncertain);
+        const bool has_code = body.is_object() && body.contains("code") && body["code"].is_number_integer();
+        const auto code = has_code ? body["code"].get<std::int64_t>() : 0;
+        if (response.status < 200 || response.status >= 300 || body.is_discarded() || code < 0) {
+            const bool uncertain = submission && (response.status >= 500 || code == -1006 || code == -1007 ||
+                (body.is_discarded() && response.status >= 200 && response.status < 300));
+            auto diagnostic = response.diagnostics;
+            diagnostic["stage"] = body.is_discarded() ? "response_parse" : "exchange_response";
+            diagnostic["origin"] = has_code ? "exchange" : "response";
+            diagnostic["outcome_uncertain"] = uncertain;
+            if (has_code) diagnostic["binance_code"] = code;
+            if (body.is_object() && body.contains("msg") && body["msg"].is_string())
+                diagnostic["binance_message"] = safe_message(body["msg"].get<std::string>(), target);
+            const auto message = "Binance REST request failed: HTTP " + std::to_string(response.status) +
+                " code " + std::to_string(code);
+            diagnostic["message"] = message;
+            throw RequestError(message, uncertain, std::move(diagnostic));
         }
         return body;
+    }
+
+    OrderReport failure_report(const OrderRequest& request_value, const RequestError& error) {
+        OrderReport report;
+        report.client_id = request_value.client_id;
+        report.revision = ++revisions[report.client_id];
+        report.status = error.uncertain() ? OrderStatus::Unknown : OrderStatus::Rejected;
+        report.failure = error.details();
+        return report;
     }
 
     void refresh_balances() {
@@ -253,25 +338,35 @@ struct BinanceGateway::Impl : std::enable_shared_from_this<Impl> {
 
     void submit(const OrderRequest& request_value, Callback callback) {
         enqueue([self = shared_from_this(), request_value, callback = std::move(callback)]() mutable {
+            const char* stage = "parameters";
+            std::string target;
+            nlohmann::json request_info = nlohmann::json::object();
             try {
                 const auto& market = self->markets.at(request_value.symbol_index);
                 const auto parameters = "symbol=" + market.symbol + "&side=" + (request_value.buy ? "BUY" : "SELL") +
                     "&type=LIMIT&timeInForce=" + (request_value.initial_clear ? "IOC" : "FOK") +
                     "&quantity=" + request_value.quantity + "&price=" + request_value.price +
                     "&newClientOrderId=" + request_value.client_id + "&newOrderRespType=FULL";
-                const auto order = self->checked(http::verb::post,
-                    self->signed_target("/api/v3/order", parameters), true);
+                stage = "request_sign";
+                target = self->signed_target("/api/v3/order", parameters);
+                stage = "request";
+                const auto order = self->checked(http::verb::post, target, true, &request_info);
+                stage = "response_decode";
                 auto report = self->parse_order(request_value, order);
+                stage = "balance_update";
                 self->apply_report(request_value, report);
                 self->deliver(std::move(callback), std::move(report));
             } catch (const RequestError& error) {
+                self->deliver(std::move(callback), self->failure_report(request_value, error));
+            } catch (const std::exception& error) {
                 OrderReport report; report.client_id = request_value.client_id;
                 report.revision = ++self->revisions[report.client_id];
-                report.status = error.uncertain() ? OrderStatus::Unknown : OrderStatus::Rejected;
-                self->deliver(std::move(callback), std::move(report));
-            } catch (...) {
-                OrderReport report; report.client_id = request_value.client_id;
-                report.revision = ++self->revisions[report.client_id]; report.status = OrderStatus::Unknown;
+                const bool uncertain = std::string_view(stage) != "parameters" && std::string_view(stage) != "request_sign";
+                report.status = uncertain ? OrderStatus::Unknown : OrderStatus::Rejected;
+                report.failure = std::move(request_info);
+                report.failure.update({{"stage", stage}, {"origin", "local"},
+                    {"method", "POST"}, {"endpoint", "/api/v3/order"},
+                    {"outcome_uncertain", uncertain}, {"message", self->safe_message(error.what(), target)}});
                 self->deliver(std::move(callback), std::move(report));
             }
         });

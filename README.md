@@ -143,8 +143,10 @@ Metadata reference: [Binance exchangeInfo](https://github.com/binance/binance-sp
 `quantities` 为每腿下单的 base 数量（买卖均相同、扣手续费前），并附上
 订单簿更新 ID、接收时间、预计投入/回款/利润和净收益率。无机会时清空输出参数。
 当前返回配置顺序中第一个合格机会，不保证利润最大。
-金额与数量是浮点预估，尚未处理交易所过滤器、数量取整、实际费用币种和报价过期；
-扫描本身不提交订单。独立执行模块只在一轮开始前验证报价、按十进制 tick/step 取整，并按真实网关回报
+扫描仅按三腿 bid/ask 换算和配置手续费计算理论收益率，严格大于 `edge_threshold` 才返回机会；
+扫描不进行 tick/step 取整、账户余额或 dust 回款模拟。预计数量和收益均为未取整的理论值。
+下单阶段不再重复检查收益阈值。独立执行模块在一轮开始前验证报价与市场限制、按十进制
+交易所 tick/step 取整，并按真实网关回报
 推进订单。可选择本地模拟网关或 Binance Spot live REST 网关。实现说明见
 [execution_plan.md](execution_plan.md)。
 
@@ -163,8 +165,9 @@ model queue position, network latency or hidden depth and must not be treated as
 Market parsing, scanning, executor state changes, and gateway result callbacks run on the
 main thread; market WebSocket callbacks run on a dedicated network `io_context` thread. One
 `ArbitrageExecutor` admits only one cycle globally; shared symbols across groups are allowed,
-and busy-time opportunities are discarded. Before a cycle, related non-USDT balances are sold
-through the group's USDT markets with IOC orders. The three arbitrage legs then run sequentially
+and busy-time opportunities are discarded. The executable does not clear account holdings or dust
+at startup or between cycles. Initial balances, including BNB, remain untouched by cleanup.
+The three arbitrage legs run sequentially
 as LIMIT/FOK orders. Prices come from the accepted opportunity; later legs do not read the order
 book or recalculate the edge. Actual net fills determine each following quantity.
 
@@ -184,11 +187,58 @@ from cumulative fills and commissions, avoiding account REST calls between legs.
 remain gateway operations, but the current low-latency executor does not invoke them.
 
 Live mode requires `api_key_file` and `secret_key_file`; credential contents are never logged.
-With `live_test_mode: true`, the process accepts at most 10 arbitrage cycles. Failed or rejected
-cycles count toward this conservative cap. One cycle can create three normal orders and additional
-orders to clear initial balances, so the cap is ten triangular attempts, not ten individual orders.
-Restarting the process starts a new ten-cycle allowance. The checked-in
-configuration remains `paper`, so building or running the default project cannot submit live orders.
+With `live_test_mode: true`, the current executable permits at most two cycles that submit
+an order to the gateway. `max_cycles` uses `submitted_cycles`, incremented once when the first
+arbitrage `Gateway::submit` returns successfully. Startup IOC clearing orders are counted
+separately in `startup_orders_submitted` and do not consume `max_cycles`. Balance and
+preflight failures before submission do not consume the allowance. Submitted orders that are
+later rejected or have an unknown outcome still consume it; this counter records gateway
+submission, not proof of transmission from the NIC. `accepted` continues to count admitted
+validation attempts. Restarting the process resets both counters.
+
+`execution_state` and `execution_final` include a structured `rejection` object on balance or
+initial-preflight failures. It identifies the stage and code; per-leg failures include a zero-based
+leg index, symbol and side. Diagnostics include book age/limit, rounded price and quantity,
+market limits, liquidity and accepted price as applicable.
+For example, `stale_orderbook`, `notional_below_min`, and `price_worsened` distinguish
+failures previously reported as `Initial preflight failed`. Profit threshold filtering happens
+in `scan_edge`, before an opportunity reaches the executor.
+
+Automatic startup account cleanup is disabled. The executable does not invoke
+`start_initial_cleanup()` and emits no `startup_cleanup_*` events. The library retains the explicit
+cleanup API for callers that deliberately invoke it; its diagnostic results are omitted from recurring
+`execution_state` events. Ordinary arbitrage cycles use only their USDT budget and net leg fills.
+
+The first normal arbitrage leg emits dedicated events (initial IOC clearing and later legs do
+not emit these events):
+
+- `arbitrage_first_leg_submit_attempt`: order prepared, immediately before `Gateway::submit`.
+- `arbitrage_first_leg_submitted`: the gateway accepted the submission call; this is not a
+  network transmission or exchange acceptance confirmation.
+- `arbitrage_first_leg_submit_failed`: submission threw synchronously, with the error.
+- `arbitrage_first_leg_report`: a processed order report with status (`FILLED`, `REJECTED`,
+  `UNKNOWN`, etc.), and fill/commission values when the report is valid and known.
+
+Events carry cycle/client IDs, group, zero-based leg, symbol, side, LIMIT/FOK parameters,
+budget and execution mode. `paper` reports are simulated. Duplicate known revisions are
+ignored. These records let a log distinguish first-leg execution from balance clearing.
+
+Gateway failures additionally emit `execution_order_failed` for any pending order, including
+initial clearing and later legs. Its `failure` object is retained as `order_failure` in execution
+state/final records and included in first-leg reports. It includes the failed stage, origin,
+method and endpoint (without query), elapsed time, completed DNS/connect/TLS/write/read
+timings, request-write flags, and whether the outcome is uncertain. Transport failures carry
+an error category/code/message; HTTP failures carry status and Binance `code`/`msg` when
+available. An invalid response identifies `response_parse` or `response_decode`.
+API keys, secrets, signed targets and signature values are redacted; response bodies and
+request headers are not logged. Error text is limited to 1024 bytes.
+
+Failures before writing the order request are known not to have sent that request. Once
+writing begins, transport failures remain `UNKNOWN`; HTTP 5xx and Binance -1006/-1007 are
+also treated as uncertain, in accordance with the
+[Binance error documentation](https://developers.binance.com/en/docs/products/spot/errors).
+A complete HTTP response is processed even if subsequent TLS shutdown reports an error.
+No automatic order retry is added.
 
 Example live-only fields:
 

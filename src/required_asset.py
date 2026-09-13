@@ -2,11 +2,11 @@
 Binance 三角套利 symbol 组合生成器
 --------------------------------
 从 Binance 现货 exchangeInfo 接口拉取全部交易对，自动找出所有可以构成
-三角套利的 symbol 组合，并按配置的必需资产进行过滤。
+三角套利的 symbol 组合，排除法币和 USDT 以外的稳定币，并按必需资产过滤。
 
 用法:
     pip install requests
-    python binance_triangles.py
+    python src/required_asset.py
 
 输出:
     控制台打印匹配数量，并生成 binance_triangles.json，
@@ -29,12 +29,101 @@ import requests
 # 留空 set() 表示不过滤，输出全部三角组合（数量会非常多）。
 REQUIRED_ASSETS = {"USDT"}
 
+# 法币资产排除表：新增法币代码时在这里补充。
+# 按 exchangeInfo 的 baseAsset / quoteAsset 精确匹配，不按 symbol 后缀匹配。
+FIAT_ASSETS = {
+    "AED",
+    "ARS",
+    "AUD",
+    "AZN",
+    "BAM",
+    "BDT",
+    "BGN",
+    "BOB",
+    "BRL",
+    "BYN",
+    "CAD",
+    "CHF",
+    "CLP",
+    "CNY",
+    "COP",
+    "CRC",
+    "CZK",
+    "DKK",
+    "DOP",
+    "DZD",
+    "EGP",
+    "EUR",
+    "GBP",
+    "GEL",
+    "GHS",
+    "HKD",
+    "HUF",
+    "IDR",
+    "ILS",
+    "INR",
+    "ISK",
+    "JPY",
+    "KES",
+    "KHR",
+    "KRW",
+    "KWD",
+    "KZT",
+    "LKR",
+    "MAD",
+    "MDL",
+    "MMK",
+    "MNT",
+    "MXN",
+    "MYR",
+    "NGN",
+    "NOK",
+    "NPR",
+    "NZD",
+    "PEN",
+    "PHP",
+    "PKR",
+    "PLN",
+    "PYG",
+    "QAR",
+    "RON",
+    "RSD",
+    "RUB",
+    "SAR",
+    "SEK",
+    "SGD",
+    "THB",
+    "TND",
+    "TRY",
+    "TWD",
+    "UAH",
+    "UGX",
+    "USD",
+    "UYU",
+    "UZS",
+    "VES",
+    "VND",
+    "XAF",
+    "XOF",
+    "ZAR",
+    "ZMW",
+}
+
+# 稳定币资产代码表（不代表这些资产目前均在 Binance 现货上市）。
+# 稳定币中只允许 USDT；新增资产时需维护此表，不能只按 USD 字样判断。
+STABLECOIN_ASSETS = {
+    "USDT", "USDC", "FDUSD", "USD1", "USDS", "DAI", "USDE", "U",
+    "TUSD", "USDP", "BUSD", "GUSD", "PYUSD", "RLUSD", "FRAX", "USDD",
+    "USDG", "XUSD", "AEUR", "EURI", "EURC", "EURT", "EURS",
+}
+EXCLUDED_ASSETS = FIAT_ASSETS | (STABLECOIN_ASSETS - {"USDT"})
+
 # 只统计允许现货交易、状态为 TRADING 的交易对
 EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
 
 
 def fetch_symbols():
-    """拉取所有可交易的 (base, quote, symbol) 三元组"""
+    """拉取可交易且不含法币或其他稳定币的 (base, quote, symbol) 三元组。"""
     resp = requests.get(EXCHANGE_INFO_URL, timeout=10)
     resp.raise_for_status()
     data = resp.json()
@@ -44,6 +133,8 @@ def fetch_symbols():
         if s["status"] != "TRADING":
             continue
         if not s.get("isSpotTradingAllowed", True):
+            continue
+        if s["baseAsset"] in EXCLUDED_ASSETS or s["quoteAsset"] in EXCLUDED_ASSETS:
             continue
         symbols.append((s["baseAsset"], s["quoteAsset"], s["symbol"]))
     return symbols
@@ -89,11 +180,15 @@ def find_triangles(pair_symbol, asset_neighbors, required_assets):
                 if required_assets and not (tri_key & required_assets):
                     continue
 
-                triangles.append(sorted([
-                    pair_symbol[(a, b)],
-                    pair_symbol[(b, c)],
-                    pair_symbol[(a, c)],
-                ]))
+                triangles.append(
+                    sorted(
+                        [
+                            pair_symbol[(a, b)],
+                            pair_symbol[(b, c)],
+                            pair_symbol[(a, c)],
+                        ]
+                    )
+                )
 
     return triangles
 
