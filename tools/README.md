@@ -1,6 +1,23 @@
-# Local replay measurement
+# Analysis and replay tools
 
-See [external_capture.md](external_capture.md) for external bidirectional capture, TLS decryption, and market/order correlation. The offline entry point is `match_capture.py`; it locates business messages but does not treat reassembled presentation frames as exact wire boundaries.
+See [external_capture.md](external_capture.md) for external bidirectional capture, TLS decryption, and market/order correlation. The full report entry point is `analyze_capture_latency.py`; `match_capture.py` performs business matching and optional boundary verification. Presentation frames alone are not exact wire boundaries.
+
+## Live first-leg capture analysis
+
+```bash
+python3 tools/analyze_capture_latency.py \
+  --local-pcap local.pcap --pcap logs/1789373319293622.pcapng \
+  --log logs/json-1789373319293622.jsonl --keys logs/capture-session.keys \
+  --output logs/latency-analysis1789373319293622.json --progress
+```
+
+The command writes JSON and a Markdown file alongside it. The retained [report](../latency-analysis1789373319293622.md) has 100/100 unique matches and 100/100 verified boundaries in both captures. On-host latency is P50 225 μs, P95 392 μs, P99 698 μs (range 164–750 μs). Application receive-to-write latency is P50 204.873 μs. The run stops after the first-leg response.
+
+Local and external capture jobs run in parallel. TShark enables out-of-order TCP reassembly, which is necessary to keep decoding TLS after late segments arrive. PDML parsing, boundary indexing, and optional dependency scans are separate passes. Progress percentages and ETA refer to the current file-reading stage, not the whole analysis. ACK observation statistics still run afterward and read both captures again; their matching uses indexes rather than repeated full-list scans.
+
+The current analyzer also reports `prepare_*` sub-stages whose durations partition `first_leg_prepare`: initialization, post/scheduling wait, entry guard, balance read, balance check/setup, snapshot, preflight checks, next-leg dispatch, order construction, and metadata construction. These require new application timestamps; the retained report has only the aggregate preparation interval. Do not add the parent interval to its children when calculating totals.
+
+## Local replay measurement
 
 `replay_benchmark.py` records public Binance 20-level partial-depth messages and market metadata. It runs a local TLS REST/WebSocket server, replays one recording to each receiver sequentially, and saves every sender timestamp, receiver log, missing sequence, and latency distribution. Orders are disabled.
 

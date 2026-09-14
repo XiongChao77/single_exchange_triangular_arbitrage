@@ -35,7 +35,7 @@ python3 tools/match_capture.py \
   --log json-session.jsonl --output capture_matches.json
 ```
 
-The tool invokes tshark for TLS decryption, TCP/TLS reassembly, and PDML parsing. Use `--tls-port 12345` for
+The tool invokes tshark for TLS decryption, TCP/TLS reassembly, and PDML parsing, explicitly enabling `tcp.reassemble_out_of_order:TRUE`. A late TCP segment can otherwise stop subsequent TLS/WebSocket decoding even when the bytes are present in the capture. Use `--tls-port 12345` for
 additional TLS ports, or `--pdml decrypted.pdml` to reuse decoded input. Market messages are matched by raw-payload
 SHA256 to `receive_sequence`; order requests are matched by `newClientOrderId` to `client_id`. `leg=0` is the first leg.
 
@@ -48,7 +48,7 @@ missing data is marked `missing_or_ambiguous`; the tool never chooses the neares
 python3 tools/analyze_capture_latency.py \
   --local-pcap local.pcap --pcap external.pcapng \
   --log json-session.jsonl --keys capture-session.keys \
-  --output latency-analysis.json
+  --output latency-analysis.json --progress
 ```
 
 The report is limited to the first leg and ends at complete HTTP request transmission. It includes application
@@ -70,7 +70,7 @@ field `exact_message_mapping` remains false; offline validation does not change 
 When both `--local-pcap` and `--pcap` are supplied, the script extracts real inbound TCP data segments and their
 corresponding pure ACKs from both captures. A sample is retained only when the ACK exactly confirms that segment,
 there is no intervening reverse data, and tshark reports no retransmission, out-of-order, or lost-segment flag.
-Keep-alive, zero-window probes, delayed or cumulative ACKs, and unmatched frames are excluded by these checks.
+These are heuristic filters: an exact ACK number alone does not prove that only one segment was acknowledged or rule out delayed ACKs, keep-alives, or zero-window probes. Interpret the result as a diagnostic baseline rather than a guaranteed clean-path measurement.
 
 Samples are paired by direction, TCP sequence, payload length, and payload hash. For each pair:
 
@@ -82,3 +82,20 @@ The report includes sample counts and P50, P95, P99, minimum, and maximum in mic
 additional observation path cost using real Binance TCP traffic. It estimates the difference between two observation
 paths and includes capture-host, mirror/TAP, driver, and timestamping effects; it is not a direct one-way propagation
 measurement, exchange RTT, or business-processing time.
+
+## Retained 100-Submission Result
+
+The [report for run 1789373319293622](../latency-analysis1789373319293622.md) contains 100 unique matches and 100 verified boundaries in each capture. All values below are μs, with nearest-rank percentiles.
+
+| Interval | P50 | P95 | P99 | Minimum | Maximum |
+|---|---:|---:|---:|---:|---:|
+| On-host capture | 225.000 | 392.000 | 698.000 | 164.000 | 750.000 |
+| External capture | 621.500 | 806.300 | 1163.200 | 297.800 | 1163.800 |
+| External minus on-host | 379.900 | 510.300 | 531.700 | 99.800 | 535.700 |
+| On-host minus application | 13.201 | 47.374 | 97.643 | -1.073 | 239.326 |
+
+The ACK baseline has 22,832 paired samples (P50 374.900, P95 550.100, P99 736.100 μs). It is separate from the 100 business samples. Its proximity to the per-order external-minus-local median supports a capture-path explanation, but does not establish a causal breakdown or justify subtracting that median from every order. The baseline currently retains only nonnegative paired differences.
+
+The small negative local residual is retained as measured; these boundaries do not support treating every residual as physical processing time. Calculate differences per order before taking percentiles.
+
+This run ends each cycle after the first-leg response and records 100 first-leg submissions. Response time is excluded from each latency interval but can delay availability for the next cycle because the REST worker processes requests sequentially. `gateway_queue` measures enqueue-to-worker-start time; `first_leg_prepare` measures cycle-start-to-order-prepared time.

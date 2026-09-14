@@ -1,6 +1,7 @@
 """Conservative PDML TCP/TLS boundary proof. Never exports payloads or secrets."""
 from collections import defaultdict
 from decimal import Decimal
+from bisect import bisect_left, bisect_right
 import xml.etree.ElementTree as ET
 
 
@@ -17,14 +18,15 @@ def raw(field):
     return bytes.fromhex(field.get('value', ''))
 
 
-def coverage(packets, start, data):
+def coverage(packets, start, data, presorted=False):
     """First-observed coverage of [start,end); detect conflicting overlaps, not just flags."""
     end = start + len(data)
     seen = bytearray(len(data))
     contributing = []
     complete = None
     last_time = None
-    for p in sorted(packets, key=lambda p: p['frame']):
+    ordered = packets if presorted else sorted(packets, key=lambda p: p['frame'])
+    for p in ordered:
         lo, hi = max(start, p['seq']), min(end, p['seq'] + len(p['data']))
         if lo >= hi:
             continue
@@ -50,14 +52,18 @@ def coverage(packets, start, data):
 
 
 class BoundaryIndex:
-    def __init__(self, path, target_frames):
+    def __init__(self, path, target_frames, progress=False, progress_label=None):
         self.packets = {}
         self.streams = defaultdict(list)
+        self.sequence_index = {}
         self.targets = {}
         # Keep XML only for business targets and TLS reassembly dependencies.
         self.path = path
         needed = set(map(int, target_frames))
-        for _, packet in ET.iterparse(path, events=('end',)):
+        from progress import ProgressFile
+        label = progress_label or path.name
+        with ProgressFile(path, f"{label} index", progress) as source:
+          for _, packet in ET.iterparse(source, events=('end',)):
             if packet.tag != 'packet':
                 continue
             number = value(packet, 'frame.number')
@@ -84,11 +90,24 @@ class BoundaryIndex:
                 self.targets[number] = ET.fromstring(ET.tostring(packet))
             packet.clear()
         # Dependencies may precede a target, so load those in a second streaming pass.
+        # Build a sequence interval index once.  Boundary verification can then
+        # inspect only segments overlapping the target TLS record instead of
+        # rescanning every earlier segment in the TCP stream.
+        for direction, packets in self.streams.items():
+            by_sequence = sorted(packets, key=lambda p: (p['seq'], p['frame']))
+            prefix_end = []
+            highest_end = 0
+            for packet in by_sequence:
+                highest_end = max(highest_end, packet['seq'] + len(packet['data']))
+                prefix_end.append(highest_end)
+            self.sequence_index[direction] = (by_sequence, [q['seq'] for q in by_sequence], prefix_end)
+
         deps = {int(f.get('show')) for packet in self.targets.values()
                 for f in fields(packet, 'tls.segment') if f.get('show', '').isdigit()}
         missing = deps - self.targets.keys()
         if missing:
-            for _, packet in ET.iterparse(path, events=('end',)):
+            with ProgressFile(path, f"{label} deps", progress) as source:
+              for _, packet in ET.iterparse(source, events=('end',)):
                 if packet.tag != 'packet':
                     continue
                 n = value(packet, 'frame.number')
@@ -144,7 +163,16 @@ class BoundaryIndex:
             raise ValueError('tls_header_mismatch')
         if raw(fields(record, 'tls.app_data')[0]) != data[5:]:
             raise ValueError('tls_ciphertext_mismatch')
-        proof = coverage([q for q in self.streams[p['direction']] if q['frame'] <= frame], start, data)
+        by_sequence, starts, prefix_end = self.sequence_index.get(p['direction'], ([], [], []))
+        end = start + len(data)
+        # prefix_end is monotonic, so this finds the first sequence-indexed
+        # segment whose byte range can reach the record.  The upper bound
+        # excludes segments beginning at or after the record's end.
+        first = bisect_right(prefix_end, start)
+        last = bisect_left(starts, end)
+        candidates = [q for q in by_sequence[first:last] if q['frame'] <= frame]
+        candidates.sort(key=lambda q: q['frame'])
+        proof = coverage(candidates, start, data, presorted=True)
         proof.update(tcp_stream=p['direction'][0], source=p['direction'][1:3], destination=p['direction'][3:],
             presentation_frame=frame)
         return proof
@@ -194,10 +222,10 @@ class BoundaryIndex:
             return {'status': 'unverified', 'reason': str(error)}
 
 
-def validate_matches(path, matches):
+def validate_matches(path, matches, progress=False, progress_label=None):
     frames = {c['presentation_frame'] for row in matches['orders']
               for key in ('market_candidates', 'order_candidates') for c in row[key]}
-    index = BoundaryIndex(path, frames)
+    index = BoundaryIndex(path, frames, progress, progress_label)
     for row in matches['orders']:
         row['boundary_validation'] = 'unverified'
         row['verified_capture_latency_us'] = None

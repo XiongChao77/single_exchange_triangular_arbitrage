@@ -41,6 +41,8 @@ struct FakeGateway : Gateway {
     Balances wallet{{"USDT",1000},{"BNB",5}}; std::deque<Action> actions;
     std::vector<OrderRequest> requests; unsigned queries=0,cancels=0; bool duplicate=false, throw_submit=false;
     std::function<void(std::size_t)> after_fill;
+    bool defer = false;
+    std::function<void()> deferred;
     nlohmann::json failure = nlohmann::json::object();
     explicit FakeGateway(boost::asio::io_context& context):io(context) {}
     Balances balances() const override { return wallet; }
@@ -62,7 +64,9 @@ struct FakeGateway : Gateway {
             report.commissions[fee_asset]=fee; wallet[fee_asset]-=fee;
             if(after_fill) after_fill(requests.size());
         }
-        boost::asio::post(io,[callback,report,duplicate=duplicate]{ callback(report); if(duplicate) callback(report); });
+        auto deliver=[callback,report,duplicate=duplicate]{ callback(report); if(duplicate) callback(report); };
+        if (defer) deferred=std::move(deliver);
+        else boost::asio::post(io,std::move(deliver));
     }
     void query(const OrderRequest&,Callback) override { ++queries; }
     void cancel(const OrderRequest&,Callback) override { ++cancels; }
@@ -73,6 +77,23 @@ struct Fixture {
     Fixture(){ populate(books); check(books.scan_edge(0,opportunity),"Fixture must be profitable"); }
     void run(){ io.run(); io.restart(); }
 };
+void timeout_tests() {
+    for (auto action : {Action::Fill, Action::Reject, Action::Unknown, Action::Open}) {
+        Fixture f; f.gateway.defer=true; f.gateway.actions={action};
+        auto o=options(); o.execution_timeout=std::chrono::milliseconds(2);
+        ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,o);
+        check(e.try_start(f.opportunity),"Initial cycle rejected"); f.run();
+        check(e.state()==State::LegPending && e.stats()["waiting_gateway"]==true &&
+              !e.try_start(f.opportunity),"Timeout released a busy gateway");
+        auto deliver=std::move(f.gateway.deferred); deliver();
+        check(e.state()==State::Idle && e.stats()["gateway_busy"]==false &&
+              e.stats()["waiting_gateway"]==false && e.stats()["failed"]==1 &&
+              f.gateway.requests.size()==1,"Late response advanced cycle or counted failure twice");
+        deliver();
+        check(e.stats()["failed"]==1,"Duplicate late response changed failure count");
+        check(e.try_start(f.opportunity),"Gateway completion did not release executor");
+    }
+}
 void tests() {
     {
         const auto path=std::filesystem::temp_directory_path()/("cycle-limit-"+std::to_string(steady_time_ns())+".json");
@@ -124,7 +145,9 @@ void tests() {
     {
         Fixture f; f.gateway.actions={Action::Open}; auto o=options(); o.execution_timeout=std::chrono::milliseconds(2);
         ArbitrageExecutor e(f.io,f.config,f.books,markets(),f.gateway,o); e.try_start(f.opportunity); f.run();
-        check(e.state()==State::Halted && f.gateway.queries==0 && f.gateway.cancels==0,"Timeout initiated recovery requests");
+        check(e.state()==State::Idle && e.stats()["stop_reason"]=="cycle_failed" &&
+              f.gateway.queries==0 && f.gateway.cancels==0 && e.try_start(f.opportunity),
+              "Timeout ended the cycle and blocked the next cycle");
     }
     {
         Fixture f; auto b=*f.books.get(1); b.received_steady_ns=1; f.books.update(1,b);
@@ -254,7 +277,9 @@ void tests() {
         e.try_start(f.opportunity); f.run();
         check(events==std::vector<std::string>{"arbitrage_first_leg_submit_attempt","arbitrage_first_leg_submit_failed"},
               "Throwing submit logged success");
-        check(e.state()==State::Halted && e.stats()["submitted_cycles"]==0,"Failed submit consumed cap");
+        check(e.state()==State::Idle && e.stats()["stop_reason"]=="cycle_failed" &&
+              e.stats()["submitted_cycles"]==0 && e.try_start(f.opportunity),
+              "Failed submit consumed cap or blocked the next cycle");
     }
     {
         Fixture f; auto b=*f.books.get(1); b.received_steady_ns=1; f.books.update(1,b);
@@ -410,5 +435,5 @@ void tests() {
     }
 }
 }
-int main(){ try{ tests(); std::cout<<"Execution tests passed\n"; return 0; }
+int main(int argc,char** argv){ try{ timeout_tests(); if(argc<2 || std::string(argv[1])!="--timeout-only") tests(); std::cout<<"Execution tests passed\n"; return 0; }
 catch(const std::exception& error){ std::cerr<<error.what()<<'\n'; return 1; } }

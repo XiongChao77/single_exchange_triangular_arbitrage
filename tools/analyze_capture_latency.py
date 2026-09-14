@@ -2,11 +2,13 @@
 """First-leg submission latency; ends at request write, before any response."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import subprocess
 import sys
 import tempfile
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,6 +19,16 @@ STAGES = [
     ("parse_update_scan", "market_processed_ns", "edge_found_ns"),
     ("edge_to_cycle", "edge_found_ns", "cycle_started_ns"),
     ("first_leg_prepare", "cycle_started_ns", "order_prepared_ns"),
+    ("prepare_state_init", "cycle_started_ns", "cycle_post_begin_ns"),
+    ("prepare_post_wait", "cycle_post_begin_ns", "cycle_begin_ns"),
+    ("prepare_begin_guard", "cycle_begin_ns", "balance_read_begin_ns"),
+    ("prepare_balance_read", "balance_read_begin_ns", "balance_read_end_ns"),
+    ("prepare_balance_check_setup", "balance_read_end_ns", "snapshot_begin_ns"),
+    ("prepare_snapshot", "snapshot_begin_ns", "snapshot_end_ns"),
+    ("prepare_preflight_checks", "snapshot_end_ns", "preflight_end_ns"),
+    ("prepare_next_leg", "preflight_end_ns", "first_order_begin_ns"),
+    ("prepare_order_build", "first_order_begin_ns", "first_order_end_ns"),
+    ("prepare_metadata", "first_order_end_ns", "order_prepared_ns"),
     ("prepared_to_enqueue", "order_prepared_ns", "gateway_enqueued_ns"),
     ("gateway_queue", "gateway_enqueued_ns", "worker_begin_ns"),
     ("worker_before_sign", "worker_begin_ns", "sign_begin_ns"),
@@ -29,26 +41,35 @@ STAGES = [
 
 def analyze(log, matches):
     reports = {}
-    with Path(log).open() as source:
-        for number, line in enumerate(source, 1):
-            row = json.loads(line)
-            if row.get("event") == "execution_order_write":
-                reports[row["fields"]["client_id"]] = (number, row["fields"])
-            elif row.get("event") == "execution_order_latency":
-                client = row["fields"]["client_id"]
-                if client in reports:
-                    write_fields = reports[client][1]
-                    write_latency = write_fields.setdefault("latency", {})
-                    report_latency = row["fields"].get("latency", {})
-                    write_latency.setdefault("market_received_realtime_ns", report_latency.get("market_received_realtime_ns"))
-                    write_latency.setdefault("kernel_rx", report_latency.get("kernel_rx", {}))
-                    write_latency.setdefault("transport", {}).setdefault("kernel_tx", report_latency.get("transport", {}).get("kernel_tx", {}))
-                else:
-                    reports[client] = (number, row["fields"])
+    # New match files carry the latency records collected by match_capture,
+    # avoiding a second full pass over a potentially multi-gigabyte JSONL log.
+    # Keep the fallback for older match files and direct callers.
+    embedded = any("latency" in row for row in matches.get("orders", []))
+    if not embedded:
+        with Path(log).open() as source:
+            for number, line in enumerate(source, 1):
+                row = json.loads(line)
+                if row.get("event") == "execution_order_write":
+                    reports[row["fields"]["client_id"]] = (number, row["fields"])
+                elif row.get("event") == "execution_order_latency":
+                    client = row["fields"]["client_id"]
+                    if client in reports:
+                        write_fields = reports[client][1]
+                        write_latency = write_fields.setdefault("latency", {})
+                        report_latency = row["fields"].get("latency", {})
+                        write_latency.setdefault("market_received_realtime_ns", report_latency.get("market_received_realtime_ns"))
+                        write_latency.setdefault("kernel_rx", report_latency.get("kernel_rx", {}))
+                        write_latency.setdefault("transport", {}).setdefault("kernel_tx", report_latency.get("transport", {}).get("kernel_tx", {}))
+                    else:
+                        reports[client] = (number, row["fields"])
     result = []
     for match in matches["orders"]:
-        number, fields = reports[match["client_id"]]
-        latency = fields.get("latency", {})
+        if embedded:
+            number = match.get("log_line")
+            latency = match.get("latency", {})
+        else:
+            number, fields = reports[match["client_id"]]
+            latency = fields.get("latency", {})
         if latency.get("leg") != 0:
             continue
         points = dict(latency)
@@ -123,6 +144,7 @@ def analyze(log, matches):
         ],
         "decoded_market_payloads": matches["decoded_market_payloads"],
         "decoded_order_requests": matches["decoded_order_requests"],
+        "market_decode_diagnostics": matches.get("market_decode_diagnostics", {}),
         "orders": result,
     }
 
@@ -259,6 +281,7 @@ def main():
     parser.add_argument("--keys", "--keylog", dest="keys", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path, help="JSON output; Markdown written alongside it")
     parser.add_argument("--tls-port", action="append", type=int, default=[])
+    parser.add_argument("--progress", action="store_true", help="Show capture parsing progress and ETA")
     args = parser.parse_args()
     inputs = [args.log, args.pcap, args.keys] + ([args.local_pcap] if args.local_pcap else [])
     for path in inputs:
@@ -269,8 +292,8 @@ def main():
     markdown = args.output.with_suffix(".md")
     if any(p.resolve() in [q.resolve() for q in inputs] for p in [args.output, markdown]):
         parser.error("Output must not overwrite an input")
-    with tempfile.TemporaryDirectory() as directory:
-        matches = Path(directory) / "matches.json"
+
+    def run_match_capture(pcap, output, progress_label):
         command = [
             sys.executable,
             str(Path(__file__).with_name("match_capture.py")),
@@ -279,36 +302,46 @@ def main():
             "--log",
             str(args.log),
             "--pcap",
-            str(args.pcap),
+            str(pcap),
             "--keylog",
             str(args.keys),
             "--output",
-            str(matches),
+            str(output),
         ]
         for port in args.tls_port:
             command += ["--tls-port", str(port)]
-        subprocess.run(command, check=True)
+        if args.progress:
+            command += ["--progress"]
+            command += ["--progress-label", progress_label]
+            print(f"[capture] decoding {pcap} ...", file=sys.stderr, flush=True)
+        started = time.monotonic()
+        completed = subprocess.run(command, check=True)
+        if args.progress:
+            elapsed = time.monotonic() - started
+            print(f"[capture] finished {pcap} in {elapsed:.1f}s", file=sys.stderr, flush=True)
+        return completed
+
+    with tempfile.TemporaryDirectory() as directory:
+        matches = Path(directory) / "matches.json"
+        local_matches = Path(directory) / "local-matches.json" if args.local_pcap else None
+
+        if local_matches:
+            # The two captures are independent: each gets its own tshark and
+            # PDML stream.  Run them concurrently, then merge their results
+            # after both boundary-validation jobs have completed.
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="capture-match") as pool:
+                external_future = pool.submit(run_match_capture, args.pcap, matches, "external")
+                local_future = pool.submit(run_match_capture, args.local_pcap, local_matches, "local")
+                external_future.result()
+                local_future.result()
+        else:
+            run_match_capture(args.pcap, matches, "external")
+
         result = analyze(args.log, json.loads(matches.read_text()))
         if args.local_pcap:
-            local_matches = Path(directory) / "local-matches.json"
-            local_command = [
-                sys.executable,
-                str(Path(__file__).with_name("match_capture.py")),
-                "--verify-boundaries",
-                "--first-leg-only",
-                "--log",
-                str(args.log),
-                "--pcap",
-                str(args.local_pcap),
-                "--keylog",
-                str(args.keys),
-                "--output",
-                str(local_matches),
-            ]
-            for port in args.tls_port:
-                local_command += ["--tls-port", str(port)]
-            subprocess.run(local_command, check=True)
-            local_by_client = {row["client_id"]: row for row in json.loads(local_matches.read_text())["orders"]}
+            local_match_result = json.loads(local_matches.read_text())
+            local_by_client = {row["client_id"]: row for row in local_match_result["orders"]}
+            result["local_market_decode_diagnostics"] = local_match_result.get("market_decode_diagnostics", {})
             for row in result["orders"]:
                 local = local_by_client.get(row["client_id"])
                 if local:

@@ -12,6 +12,12 @@ namespace triangular {
 // Context owns the descriptor; flock also serializes separate contexts/processes.
 inline void enable_tls_keylog(SSL_CTX* context, const std::filesystem::path& path) {
     if (path.empty()) return;
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code error;
+        std::filesystem::create_directories(parent, error);
+        if (error) throw std::runtime_error("Cannot create TLS keylog directory: " + error.message());
+    }
     static const int index = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr,
         [](void*, void* value, CRYPTO_EX_DATA*, int, long, void*) {
             if (value) { auto* descriptor = static_cast<int*>(value); ::close(*descriptor); delete descriptor; }

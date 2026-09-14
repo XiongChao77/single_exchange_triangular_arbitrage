@@ -104,6 +104,7 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     nlohmann::json cleanup_results = nlohmann::json::object();
     State state = State::Idle;
     bool stopping = false, failed = false, cycle_submitted = false;
+    bool gateway_busy = false, waiting_gateway = false;
     nlohmann::json rejection = nlohmann::json::object();
     nlohmann::json order_failure = nlohmann::json::object();
     std::string reason, cycle;
@@ -115,6 +116,10 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     Balances holdings, dust;
     Decimal budget = 0;
     std::int64_t cycle_started_ns = 0, previous_report_ns = 0;
+    struct PreparationTiming {
+        std::int64_t post_begin = 0, begin = 0, balance_begin = 0, balance_end = 0;
+        std::int64_t snapshot_begin = 0, snapshot_end = 0, preflight_end = 0, order_begin = 0, order_end = 0;
+    } preparation;
     std::optional<OrderRequest> pending;
     OrderReport accounted;
 
@@ -128,11 +133,17 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     }
 
     nlohmann::json status() const {
+        const bool limit_reached = options.max_cycles != 0 && submitted_cycles >= options.max_cycles;
+        const std::string stop_reason = limit_reached ? "max_cycles_reached" :
+            (state == State::Halted ? "halted" :
+             (stopping ? "stopped" : (failed ? "cycle_failed" : "")));
         nlohmann::json result = {{"state", state_name(state)}, {"cycle_id", cycle}, {"reason", reason},
+            {"gateway_busy", gateway_busy}, {"waiting_gateway", waiting_gateway},
             {"accepted", accepted}, {"submitted_cycles", submitted_cycles},
             {"cycle_submitted", cycle_submitted}, {"rejection", rejection}, {"order_failure", order_failure}, {"completed", completed}, {"failed", failures},
             {"rejected_busy", rejected_busy}, {"rejected_limit", rejected_limit},
             {"max_cycles", options.max_cycles}, {"holdings", balance_json(holdings)},
+            {"limit_reached", limit_reached}, {"stop_reason", stop_reason},
             {"dust", balance_json(dust)}, {"budget_usdt", decimal_text(budget)},
             {"leg", leg_number}, {"stopping", stopping},
             {"startup_cleanup_started", cleanup_started}, {"startup_cleanup_done", cleanup_done},
@@ -154,6 +165,14 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
     }
     void halt(std::string why) {
         timeout.cancel(); cleanup_wait.cancel(); state = State::Halted; reason = std::move(why); ++failures; publish();
+    }
+    // A failed cycle cannot release its slot while its REST task is still running.
+    void fail_cycle(std::string why) {
+        timeout.cancel(); cleanup_wait.cancel(); failed = true; reason = std::move(why);
+        if (!waiting_gateway) ++failures;
+        waiting_gateway = gateway_busy;
+        if (!waiting_gateway) { pending.reset(); state = State::Idle; }
+        publish();
     }
     bool fresh(const OrderBook& book) const {
         const auto age = steady_time_ns() - book.received_steady_ns;
@@ -232,7 +251,9 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
 
     bool preflight() {
         auto balances = holdings;
+        if (config.latency_timestamps) preparation.snapshot_begin = steady_time_ns();
         const auto snapshot = books.snapshot();
+        if (config.latency_timestamps) preparation.snapshot_end = steady_time_ns();
         const Decimal fee = Decimal(1) - Decimal(nlohmann::json(config.commission_taker).dump());
         for (std::size_t i = 0; i < opportunity.path.size(); ++i) {
             const auto& leg = opportunity.path[i];
@@ -263,7 +284,9 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
 
     void start_arbitrage() {
         holdings = {{"USDT", budget}};
-        if (!preflight()) { failed = true; finish(); return; }
+        const bool ready = preflight();
+        if (config.latency_timestamps) preparation.preflight_end = steady_time_ns();
+        if (!ready) { failed = true; finish(); return; }
         leg_number = 0;
         next_leg();
     }
@@ -275,8 +298,10 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         timeout.expires_after(options.execution_timeout);
         timeout.async_wait([weak = weak_from_this()](const boost::system::error_code& error) {
             if (!error)
-                if (auto self = weak.lock(); self && self->state != State::Idle && self->state != State::Halted)
-                    self->halt("Execution timeout");
+                if (auto self = weak.lock(); self && self->state != State::Idle && self->state != State::Halted) {
+                    if (self->pending && self->pending->initial_clear) self->halt("Execution timeout");
+                    else self->fail_cycle("Execution timeout");
+                }
         });
     }
     void clear_initial_position() {
@@ -356,8 +381,11 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         clear_initial_position();
     }
     void begin() {
+        if (config.latency_timestamps) preparation.begin = steady_time_ns();
         if (state != State::Validating || stopping) return;
+        if (config.latency_timestamps) preparation.balance_begin = steady_time_ns();
         const auto account = gateway.balances();
+        if (config.latency_timestamps) preparation.balance_end = steady_time_ns();
         if (!account.contains("USDT") || account.at("USDT") < budget) {
             rejection = {{"stage", "balance_check"}, {"code", "insufficient_usdt"},
                 {"available_usdt", decimal_text(account.contains("USDT") ? account.at("USDT") : Decimal(0))},
@@ -369,16 +397,22 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
 
     void next_leg() {
         if (leg_number == opportunity.path.size()) { finish(); return; }
+        if (config.latency_timestamps && leg_number == 0) preparation.order_begin = steady_time_ns();
         const auto& leg = opportunity.path[leg_number];
         const auto& market = markets.at(leg.index);
         const auto order = prepare_fast(leg, holdings[leg.buy ? market.quote : market.base], leg_number);
+        if (config.latency_timestamps && leg_number == 0) preparation.order_end = steady_time_ns();
         if (!order) { failed = true; reason = "Cannot size next leg"; finish(); return; }
         send(*order);
     }
 
     Gateway::Callback callback() {
         return [weak = weak_from_this()](OrderReport report) {
-            if (auto self = weak.lock()) self->report(report);
+            if (auto self = weak.lock()) {
+                if (!self->pending || report.client_id != self->pending->client_id) return;
+                self->gateway_busy = false;
+                self->report(report);
+            }
         };
     }
     bool is_first_leg() const {
@@ -407,7 +441,18 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
             {"market_received_realtime_ns",opportunity.market_received_realtime_ns},
             {"market_processed_ns",opportunity.market_processed_ns},{"edge_found_ns",opportunity.edge_found_ns},
             {"kernel_rx",opportunity.kernel_rx},{"cycle_started_ns",cycle_started_ns},
-            {"previous_report_ns",previous_report_ns},{"order_prepared_ns",steady_time_ns()}};
+            {"previous_report_ns",previous_report_ns}};
+        if (config.latency_timestamps) {
+            if (!order.initial_clear && leg_number == 0) {
+                order.latency.update({{"cycle_post_begin_ns",preparation.post_begin},
+                    {"cycle_begin_ns",preparation.begin}, {"balance_read_begin_ns",preparation.balance_begin},
+                    {"balance_read_end_ns",preparation.balance_end}, {"snapshot_begin_ns",preparation.snapshot_begin},
+                    {"snapshot_end_ns",preparation.snapshot_end}, {"preflight_end_ns",preparation.preflight_end},
+                    {"first_order_begin_ns",preparation.order_begin}, {"first_order_end_ns",preparation.order_end}});
+            }
+            // Include latency metadata construction in the preparation boundary.
+            order.latency["order_prepared_ns"] = steady_time_ns();
+        }
         pending = std::move(order); accounted = {};
         state = pending->initial_clear ? State::ClearingInitialPosition : State::LegPending;
         publish();
@@ -417,6 +462,7 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
                 pending->latency["gateway_submit_ns"]=steady_time_ns();
                 pending->latency["gateway_submit_realtime_ns"]=realtime_ns();
             }
+            gateway_busy = true;
             gateway.submit(*pending, callback());
             if (pending->initial_clear) ++startup_orders_submitted;
             else if (!cycle_submitted) { cycle_submitted = true; ++submitted_cycles; }
@@ -424,8 +470,11 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
             publish();
         }
         catch (const std::exception& error) {
+            gateway_busy = false;
             first_leg_event("arbitrage_first_leg_submit_failed", {{"error", error.what()}});
-            halt(std::string("Order submission failed: ") + error.what());
+            const auto message = std::string("Order submission failed: ") + error.what();
+            if (pending && pending->initial_clear) halt(message);
+            else fail_cycle(message);
         }
     }
 
@@ -450,11 +499,17 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         }
         if (value.status == OrderStatus::Unknown) {
             first_leg_event("arbitrage_first_leg_report", {{"order_status", "UNKNOWN"}, {"revision", value.revision}, {"failure", value.failure}});
-            halt("Order outcome unknown"); return;
+            if (pending->initial_clear) halt("Order outcome unknown");
+            else fail_cycle("Order outcome unknown");
+            return;
         }
         const Decimal quantity_limit(pending->quantity);
         if (value.filled_qty < accounted.filled_qty || value.filled_qty > quantity_limit ||
-            value.filled_quote < accounted.filled_quote) { halt("Invalid cumulative fill"); return; }
+            value.filled_quote < accounted.filled_quote) {
+            if (pending->initial_clear) halt("Invalid cumulative fill");
+            else fail_cycle("Invalid cumulative fill");
+            return;
+        }
         const Decimal filled_delta = value.filled_qty - accounted.filled_qty;
         const Decimal quote_delta = value.filled_quote - accounted.filled_quote;
         const auto& market = markets.at(pending->symbol_index);
@@ -478,8 +533,18 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
             {"filled_quote", decimal_text(value.filled_quote)}, {"commissions", balance_json(value.commissions)},
             {"accounting_complete", value.accounting_complete}, {"failure", value.failure}});
         publish();
+        if (waiting_gateway) {
+            // The gateway has completed its request and balance update. Keep
+            // the timeout result, but never advance a timed-out cycle.
+            waiting_gateway = false;
+            pending.reset(); state = State::Idle; publish(); return;
+        }
         if (!terminal(value.status)) return;
-        if (!value.accounting_complete) { halt("Incomplete fill accounting"); return; }
+        if (!value.accounting_complete) {
+            if (pending->initial_clear) halt("Incomplete fill accounting");
+            else fail_cycle("Incomplete fill accounting");
+            return;
+        }
         const bool initial_clear = pending->initial_clear;
         const bool filled = value.status == OrderStatus::Filled && value.filled_qty == quantity_limit;
         const auto asset = pending->buy ? market.quote : market.base;
@@ -495,6 +560,11 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
             clear_initial_position(); return;
         }
         if (!filled) { failed = true; reason = "Arbitrage leg did not fill completely"; finish(); return; }
+        // Temporary test: stop after the first-leg terminal response.
+        if (leg_number == 0) {
+            fail_cycle("First-leg response test stop");
+            return;
+        }
         ++leg_number;
         next_leg();
     }
@@ -522,6 +592,7 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         });
         if (!known) return false;
         cycle_started_ns=steady_time_ns(); previous_report_ns=0;
+        preparation = {};
         state = State::Validating; opportunity = candidate; budget = Decimal(candidate.input_usdt);
         failed = false; cycle_submitted = false; reason.clear(); rejection = nlohmann::json::object(); order_failure = nlohmann::json::object(); pending.reset(); holdings.clear();
         leg_number = 0; order_number = 0;
@@ -529,6 +600,7 @@ struct ArbitrageExecutor::Impl : std::enable_shared_from_this<Impl> {
         ++accepted;
         publish();
         arm_timeout();
+        if (config.latency_timestamps) preparation.post_begin = steady_time_ns();
         boost::asio::post(io, [weak = weak_from_this()] { if (auto self = weak.lock()) self->begin(); });
         return true;
     }

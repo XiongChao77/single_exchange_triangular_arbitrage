@@ -4,11 +4,24 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
-from analyze_capture_latency import analyze, render
+from analyze_capture_latency import analyze, render, STAGES
 from match_capture import match
 
 
 class AnalysisTest(unittest.TestCase):
+    def test_preparation_breakdown_covers_parent_interval(self):
+        parts = [(name, start, end) for name, start, end in STAGES if name.startswith('prepare_')]
+        points = {'leg': 0, 'cycle_started_ns': 1000}
+        for _, start, end in parts:
+            points[end] = points[start] + 100
+        row = dict(client_id='a', latency=points, match_status='missing_or_ambiguous',
+                   market_candidates=[], order_candidates=[])
+        result = analyze('unused', dict(orders=[row], decoded_market_payloads=0,
+                                       decoded_order_requests=1))
+        durations = result['orders'][0]['durations_us']
+        self.assertAlmostEqual(sum(durations[name] for name, _, _ in parts),
+                               durations['first_leg_prepare'])
+
     def test_precision_missing_ambiguity_and_later_leg(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory)/'log.jsonl'

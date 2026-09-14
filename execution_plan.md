@@ -6,14 +6,11 @@ global `ArbitrageExecutor`. While it is active, other groups are rejected, so gr
 
 ## Execution Flow
 
-After a cycle is accepted, the executor performs these preflight checks once:
+Startup position clearing, when invoked, runs separately from ordinary cycles and uses LIMIT/IOC orders; USDT and BNB are protected and balances below exchange filters are recorded as dust. After a cycle is accepted:
 
 1. Confirm sufficient USDT in the Gateway balance cache.
-2. Sell existing non-USDT balances with a LIMIT/IOC order on the matching `asset/USDT` market; balances below
-   exchange filters are recorded as dust.
-3. Read all three order books once and validate age, top-level liquidity, prices, exchange filters, and profit
-   after rounding.
-4. Send three LIMIT/FOK orders in sequence.
+2. Read all three order books once and validate age, top-level liquidity, prices, exchange filters, and price deterioration against the accepted opportunity, with fee-adjusted simulated proceeds.
+3. Prepare and send LIMIT/FOK orders sequentially. The current temporary test exits after the first-leg terminal response, before advancing to the second leg.
 
 After the first leg is sent, the executor does not reread books, recalculate the edge, or query balances. Later
 prices use accepted `ArbitrageOpportunity::prices`; quantities use the previous fill and actual fee.
@@ -22,11 +19,12 @@ prices use accepted `ArbitrageOpportunity::prices`; quantities use the previous 
 
 The main state path is `IDLE -> VALIDATING -> LEG_PENDING (legs 1/2/3) -> IDLE`, with initial position clearing
 before the legs when required. Only one cycle may execute at a time. A rejected, expired, canceled, or incomplete
-leg fails the cycle and returns to `IDLE` without an emergency cleanup order. An Unknown result or a cycle
-exceeding `execution_timeout_ms` enters `HALTED`; the current version does not query, cancel, recover, or log intent.
+leg fails the current cycle and returns to `IDLE` without an emergency cleanup order, allowing a later opportunity
+to start a new cycle. The current version does not query, cancel, recover, or log intent for late or ambiguous orders.
 
-`execution_timeout_ms` covers accepting an opportunity through cleanup and all three legs. The current value is
-1000 ms; valid values are 1 to 60000 ms.
+`execution_timeout_ms` starts when a candidate is accepted, before the posted `begin()` callback and balance/preflight checks. Valid values are 1 to 60000 ms. On timeout, an outstanding gateway task keeps the executor in `LEG_PENDING` with `waiting_gateway=true`; new cycles remain blocked until the callback returns. The late result is handled without advancing to another leg, and the slot is then released. Timeout does not cancel an exchange order or abort the REST worker.
+
+The temporary first-leg response stop uses `fail_cycle("First-leg response test stop")`, so it increments the failure counter rather than the completed-three-leg counter. The [retained latency report](latency-analysis1789373319293622.md) records 100 submitted first legs. Full-cycle tests expecting three fills are incompatible with this temporary branch.
 
 ## Gateway
 
@@ -39,14 +37,13 @@ Normal arbitrage orders use LIMIT/FOK; preflight cleanup uses LIMIT/IOC. The Gat
 query/cancel for future extensions, but the low-latency path does not call them.
 
 `live_test_mode=true` defaults the process limit to two submitted cycles unless `max_cycles` is explicitly
-configured. Failed cycles and failed preflight checks count against the limit. Key files are read only in live
+configured. The limit counts cycles whose first-leg request was accepted by `gateway.submit()`; failed preflight checks do not consume it. This boundary is queue acceptance, not HTTP write completion. Key files are read only in live
 mode and are never written to logs.
 
 ## Current Scope
 
 The implementation targets the normal fill path. It has no order-intent log, cross-process recovery, user-data
-WebSocket, automatic abnormal-position cleanup, clock-offset calibration, or full rate-limit scheduler. The
-default configuration remains paper mode and sends no real orders.
+WebSocket, automatic abnormal-position cleanup, clock-offset calibration, or full rate-limit scheduler. Check `execution_mode` in the local configuration before running; `live_test_mode` only changes the default cycle limit and does not simulate orders.
 
-The executor favors bounded, explicit failure handling over automatic retries. An ambiguous order result can leave
-an unknown exchange position, so the safe response is to enter `HALTED` and require external reconciliation.
+The executor favors bounded, explicit cycle failure over automatic retries. An ambiguous order result can leave an
+unknown exchange position; the cycle fails; if its gateway task is still outstanding, executor availability waits for that task to return. External reconciliation is still required for any unknown exchange position.

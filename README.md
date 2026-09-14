@@ -2,7 +2,7 @@
 
 A low-latency, event-driven C++20 trading system that detects and executes triangular arbitrage on Binance Spot — built as a deep dive into exchange connectivity, lock-free concurrency, and microsecond-level latency measurement.
 
-It streams live L2 order books over WebSocket, scans every configured triangle on each update, and (optionally) submits sequential LIMIT/FOK orders through a signed REST gateway. **Verified on-host first-leg submission latency: 283–392 μs across live samples**, measured from the complete inbound market-data TLS record observed in a local capture to the complete outbound order-request TLS record observed on the same host. This excludes exchange processing and order-response time.
+It streams live L2 order books over WebSocket, scans the triangles affected by each update, and submits LIMIT/FOK orders through a signed REST gateway. **Verified on-host market-to-first-order latency: P50 225 μs, P95 392 μs, P99 698 μs across 100 live submissions.** The interval runs from completion of the triggering market-data TLS record in the local capture to completion of the first-leg order-request TLS record. It excludes order-response time.
 
 ## Architecture
 
@@ -27,14 +27,19 @@ A dedicated network thread handles async DNS/TCP/TLS/WebSocket I/O (Boost.Asio +
 
 ## Measured Results
 
-**Verified live first-leg submission latency** — from complete inbound market-data TLS record to complete outbound order-request TLS record:
+The [100-submission report](latency-analysis1789373319293622.md) contains 100 unique market/order matches and 100 verified TCP/TLS boundary pairs in each capture. Percentiles use the nearest-rank method; all values below are μs.
 
-The on-host measurements below are cross-checked against 7,172 paired inbound TCP segment/ACK observations used to estimate the difference between local and external capture paths. They do not include exchange processing or order-response time.
+| Measurement | Samples | Minimum | P50 | P95 | P99 | Maximum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| On-host capture | 100 | 164.000 | **225.000** | **392.000** | **698.000** | 750.000 |
+| External capture | 100 | 297.800 | 621.500 | 806.300 | 1163.200 | 1163.800 |
+| Application receive → HTTP write completion | 100 | 145.542 | 204.873 | 377.004 | 610.471 | 694.558 |
 
-| Sample | External capture observed | On-host capture observed | Application processing |
-| --- | ---: | ---: | ---: |
-| 1 | 880 μs | **392 μs** | 357 μs |
-| 2 | 648 μs | **283 μs** | 283 μs |
+The application breakdown reports `first_leg_prepare` P50/P95 of 68.328/163.515 μs and `gateway_queue` P50/P95 of 21.690/35.416 μs. Preparation includes scheduling, balance checks, and all-three-leg preflight, even though this run stopped after the first-leg response. The report predates the finer preparation timestamps now available in the analyzer.
+
+The per-order external-minus-local interval has P50 379.900 μs. A separate TCP data/ACK comparison reports 22,832 paired samples with P50 374.900 μs. This is supporting evidence about capture-path differences, not a per-order correction or a one-way network-delay measurement. The local-minus-application residual has P50 13.201 μs; timestamp boundaries and uncertainty prevent attributing it entirely to the network stack. Percentiles of separate components do not add to the percentile of the total.
+
+The test submitted 100 first legs and waited for each gateway response before releasing the executor.
 
 **Lock-free vs. mutex-based queue**, replayed against identical recorded market data (P99, ms):
 
@@ -65,7 +70,7 @@ Ships in three execution modes — `disabled` (detection only), `paper` (simulat
 
 ## Packet-Level Latency Analysis
 
-TLS key logging is opt-in (`tls_keylog_file`) and used only for controlled packet-correlation experiments; key logs must never be committed or retained after testing.
+TLS key logging is opt-in (`tls_keylog_file`) and used only for controlled packet-correlation experiments
 
 ```bash
 # capture on the trading host
@@ -79,15 +84,15 @@ python3 tools/analyze_capture_latency.py \
   --pcap /path/to/external.pcapng \
   --log /path/to/run.jsonl \
   --keys /path/to/capture-session.keys \
-  --output /path/to/latency-analysis.json
+  --output /path/to/latency-analysis.json --progress
 ```
 
 Full setup and limitations: [tools/external_capture.md](tools/external_capture.md).
 
 ## Deep-Dive Documentation
 
-This README covers the highlights; the following documents go deeper for anyone evaluating the engineering in detail:
+This README summarizes the system; the following documents go deeper for anyone evaluating the engineering in detail:
 
 - [execution_plan.md](execution_plan.md) — execution state machine and recovery limitations
-- [tools/README.md](tools/README.md) — replay benchmark methodology (uses [tools/replay_benchmark.py](tools/replay_benchmark.py))
+- [tools/README.md](tools/README.md) — capture analysis and replay benchmark methodology (uses [tools/replay_benchmark.py](tools/replay_benchmark.py))
 - [tools/external_capture.md](tools/external_capture.md) — packet-level latency verification setup

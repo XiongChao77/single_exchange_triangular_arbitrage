@@ -3,7 +3,7 @@
   "port": "9443",
   "execution_mode": "live",
   "live_test_mode": true,
-  "max_cycles": 2,
+  "max_cycles": 100,
   "tls_keylog_file": "../logs/capture-session.keys",
   "latency_timestamps": true,
   "hmac_api_key_file": "../../financial-ml-system/LiveTrading/binance/main/hmac_api_key",
@@ -11,7 +11,7 @@
   "execution_timeout_ms": 1000,
   "max_arbitrage_usdt": 10,
   "commission_taker": 0.0001,
-  "commission_maker": 0.0001,
+  "commission_maker": 0.00002,
   "edge_threshold":  0,
   "triangles": [
     [
